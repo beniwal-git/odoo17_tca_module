@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- ── Invoice form: TCA status badge + info ───────────────────────────── -->
+    <record id="view_move_form_tca_status" model="ir.ui.view">
+        <field name="name">account.move.form.tca.peppol</field>
+        <field name="model">account.move</field>
+        <field name="inherit_id" ref="account.view_move_form"/>
+        <field name="arch" type="xml">
+
+            <!-- TCA status stat button — shown for outbound invoices once submitted -->
+            <xpath expr="//div[@name='button_box']" position="inside">
+                <!-- Hidden fields needed for invisible conditions -->
+                <field name="tca_invoice_uuid" invisible="1"/>
+                <field name="tca_submission_error" invisible="1"/>
+                <field name="tca_is_inbound" invisible="1"/>
+                
+                <!-- Retry button: only when error or rejected -->
+                <button name="action_tca_resend"
+                        type="object"
+                        class="oe_stat_button"
+                        icon="fa-refresh"
+                        invisible="tca_move_state not in ('error', 'rejected') or move_type not in ('out_invoice', 'out_refund')">
+                    <div class="o_field_widget o_stat_info">
+                        <span class="o_stat_text">Retry TCA</span>
+                    </div>
+                </button>
+                <!-- Status indicator: non-clickable display badge, shown once a UUID is assigned -->
+                <button class="oe_stat_button" icon="fa-paper-plane"
+                        invisible="tca_move_state == 'not_sent' or tca_invoice_uuid == False">
+                    <field name="tca_move_state" widget="badge"
+                           decoration-success="tca_move_state in ('delivered', 'received')"
+                           decoration-warning="tca_move_state in ('submitted', 'processing', 'uploading')"
+                           decoration-danger="tca_move_state in ('error', 'rejected', 'cancelled')"
+                           string="TCA Status"/>
+                </button>
+            </xpath>
+
+        </field>
+    </record>
+
+    <!-- ── Invoice line form: commodity type + HS code fields ─────────────── -->
+    <record id="view_invoice_line_form_tca" model="ir.ui.view">
+        <field name="name">account.move.line.form.tca.peppol</field>
+        <field name="model">account.move.line</field>
+        <field name="inherit_id" ref="account.view_move_line_tree"/>
+        <field name="arch" type="xml">
+            <!-- These columns appear in the optional columns area of the invoice line list -->
+            <xpath expr="//tree" position="inside">
+                <field name="tca_commodity_type" optional="show"
+                       string="Commodity (UAE)"
+                       column_invisible="parent.partner_id.ubl_cii_format != 'ubl_pint_ae'"/>
+                <field name="tca_hs_code" optional="hide"
+                       string="HS Code"
+                       column_invisible="parent.partner_id.ubl_cii_format != 'ubl_pint_ae'"/>
+            </xpath>
+        </field>
+    </record>
+
+    <!-- ── TCA Peppol Status list/filter ──────────────────────────────────── -->
+    <record id="view_account_move_list_tca" model="ir.ui.view">
+        <field name="name">account.move.list.tca.status</field>
+        <field name="model">account.move</field>
+        <field name="inherit_id" ref="account.view_invoice_tree"/>
+        <field name="arch" type="xml">
+            <xpath expr="//tree" position="inside">
+                <field name="tca_move_state" optional="hide" string="TCA Status"
+                       widget="badge"
+                       decoration-success="tca_move_state in ('delivered', 'received')"
+                       decoration-warning="tca_move_state in ('submitted', 'processing', 'uploading')"
+                       decoration-danger="tca_move_state in ('error', 'rejected', 'cancelled')"
+                       decoration-muted="tca_move_state == 'not_sent'"/>
+            </xpath>
+        </field>
+    </record>
+
+    <!-- ── Filters for TCA status in invoice search ───────────────────────── -->
+    <record id="view_account_move_filter_tca" model="ir.ui.view">
+        <field name="name">account.move.filter.tca.peppol</field>
+        <field name="model">account.move</field>
+        <field name="inherit_id" ref="account.view_account_invoice_filter"/>
+        <field name="arch" type="xml">
+            <xpath expr="//filter[@name='draft']" position="after">
+                <separator/>
+                <filter string="TCA: Submitted" name="tca_submitted"
+                        domain="[('tca_move_state', 'in', ['submitted', 'processing'])]"/>
+                <filter string="TCA: Delivered" name="tca_delivered"
+                        domain="[('tca_move_state', 'in', ['delivered', 'received'])]"/>
+                <filter string="TCA: Error / Rejected" name="tca_error"
+                        domain="[('tca_move_state', 'in', ['error', 'rejected'])]"/>
+                <filter string="TCA: Inbound" name="tca_inbound"
+                        domain="[('tca_is_inbound', '=', True)]"/>
+            </xpath>
+        </field>
+    </record>
+
+    <!-- ── Send &amp; Print wizard: TCA checkbox ──────────────────────────── -->
+    <!--
+        Inherits the base account send form (same target as account_peppol).
+        Adds the TCA option after the standard "Send by email" checkbox,
+        following the same position pattern as account_peppol uses for
+        checkbox_send_peppol.
+        account_peppol is declared as a conflict in __manifest__.py, so
+        option_peppol will never exist — we insert after option_send_mail directly.
+    -->
+    <record id="view_account_move_send_form_tca" model="ir.ui.view">
+        <field name="name">account.move.send.form.tca.peppol</field>
+        <field name="model">account.move.send</field>
+        <field name="inherit_id" ref="account.account_move_send_form"/>
+        <field name="arch" type="xml">
+
+            <!-- Warning banner (same area as peppol/ubl_cii warnings) -->
+            <xpath expr="//div[@name='warnings']" position="inside">
+                <field name="enable_tca" invisible="1"/>
+                <div class="alert alert-warning" role="alert"
+                     invisible="not checkbox_send_tca or not tca_warning">
+                    <field name="tca_warning"/>
+                </div>
+                <div class="alert alert-info" role="alert"
+                     invisible="not checkbox_send_tca or tca_warning or not show_ubl_company_warning">
+                    Please fill in Peppol EAS and Peppol Endpoint in your
+                    company settings to generate a complete PINT AE file.
+                </div>
+            </xpath>
+
+            <!-- TCA option block — positioned after "Send by email" option,
+                 identical pattern to how account_peppol adds its checkbox -->
+            <xpath expr="//div[@name='option_send_mail']" position="after">
+                <div name="option_tca" invisible="not enable_tca">
+                    <field name="checkbox_send_tca" nolabel="1"
+                           style="display: inline-block"/>
+                    <b>
+                        <label for="checkbox_send_tca"
+                               string="Submit via TCA Peppol (UAE)"/>
+                    </b>
+                </div>
+            </xpath>
+
+        </field>
+    </record>
+
+</odoo>

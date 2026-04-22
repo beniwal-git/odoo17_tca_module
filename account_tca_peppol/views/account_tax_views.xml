@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- PINT AE UAE VAT classification fields on the Tax form -->
+<odoo>
+
+    <record id="account_tax_form_pint_ae" model="ir.ui.view">
+        <field name="name">account.tax.form.pint_ae</field>
+        <field name="model">account.tax</field>
+        <field name="inherit_id" ref="account.view_tax_form"/>
+        <field name="arch" type="xml">
+            <!--
+              Add UAE PINT AE fields after the standard tax amount/type fields.
+              Visible only in the Accounting module context.
+            -->
+            <xpath expr="//field[@name='amount']" position="after">
+                <separator string="UAE PINT AE E-Invoicing"/>
+                <field name="tca_tax_category"
+                       help="IBT-118: UAE VAT category code for PINT AE XML generation. Leave blank to use Odoo auto-detection."/>
+                <field name="tca_exemption_reason_code"
+                       invisible="not tca_tax_category or tca_tax_category in ('S', 'AE')"
+                       help="IBT-121: AE-Exempt code list value. Required when category is Z, E, or G."/>
+                <field name="tca_exemption_reason"
+                       invisible="not tca_tax_category or tca_tax_category in ('S', 'AE')"
+                       help="IBT-120: Human-readable exemption reason text."/>
+            </xpath>
+        </field>
+    </record>
+
+</odoo>

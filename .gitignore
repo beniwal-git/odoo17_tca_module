@@ -1,0 +1,17 @@
+# Docs
+*.md
+*.doc
+*.docx
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# LLM artifacts
+llm/
+
+# Kiro
+.claude/

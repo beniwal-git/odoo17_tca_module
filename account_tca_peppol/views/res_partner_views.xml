@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Add UAE Peppol fields to the partner form -->
+    <record id="view_partner_form_tca_peppol" model="ir.ui.view">
+        <field name="name">res.partner.form.tca.peppol</field>
+        <field name="model">res.partner</field>
+        <field name="inherit_id" ref="base.view_partner_form"/>
+        <field name="arch" type="xml">
+
+            <!-- Add UAE-specific fields in the sales & purchases tab -->
+            <xpath expr="//page[@name='sales_purchases']" position="inside">
+                <group string="UAE Peppol / TCA Fields" name="tca_peppol_group">
+                    <field name="tca_legal_id_type" string="Legal ID Type (UAE)"/>
+                    <field name="tca_trade_license" string="Trade License / Registration ID"/>
+                    <field name="tca_legal_authority" string="Issuing Authority"/>
+                    <field name="tca_emirate" string="Emirate"/>
+                </group>
+            </xpath>
+
+        </field>
+    </record>
+
+</odoo>

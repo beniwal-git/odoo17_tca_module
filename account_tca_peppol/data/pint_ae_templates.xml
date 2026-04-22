@@ -1,0 +1,314 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PINT AE QWeb UBL templates — UAE-specific extensions over BIS3 / UBL 2.1
+
+  Template hierarchy (each is primary="True" = standalone, callable by name):
+
+    pint_ae_InvoiceType      ← ubl_21_InvoiceType   + ProfileExecutionID (BTAE-02)
+                                                       IssueTime (IBT-168)
+                                                       TaxExchangeRate (BTAE-04)
+                                                       BuyerCustomerParty (BTAE-01)
+
+    pint_ae_CreditNoteType   ← ubl_21_CreditNoteType + same root additions
+                                                       DiscrepancyResponse (BTAE-03)
+
+    pint_ae_TaxTotalType     ← ubl_20_TaxTotalType   + TaxIncludedIndicator (IBT-200)
+                                                       BTAE-20 minimal rendering (no subtotals)
+
+    pint_ae_InvoiceLineType  ← ubl_20_InvoiceLineType + CommodityCode (BTAE-13)
+                                                         ItemClassificationCode (IBT-158)
+                                                         AdditionalItemProperty (BTAE-09)
+                                                         ItemPriceExtension (BTAE-08/10)
+
+    pint_ae_CreditNoteLineType ← ubl_20_CreditNoteLineType + same line additions
+-->
+<odoo>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         TaxTotalType — adds TaxIncludedIndicator (IBT-200) for normal totals.
+         For BTAE-20 AED totals (btae_20_aed_total=True): TaxIncludedIndicator
+         is suppressed. The base ubl_20_TaxTotalType renders only TaxAmount +
+         empty TaxSubtotals loop (no subtotals in AED entry), which is correct.
+         This template is used by the base InvoiceLine and InvoiceType loops —
+         no separate BTAE-20 xpath is needed in InvoiceType/CreditNoteType.
+         ════════════════════════════════════════════════════════════════════════ -->
+    <template id="pint_ae_TaxTotalType"
+              inherit_id="account_edi_ubl_cii.ubl_20_TaxTotalType"
+              primary="True">
+        <!-- Insert TaxIncludedIndicator after TaxAmount, only for normal totals -->
+        <xpath expr="//*[local-name()='TaxAmount']" position="after">
+            <t xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <!--
+                  IBT-200: UAE mandate requires explicit false — prices are VAT-exclusive.
+                  Skip for BTAE-20 AED total (which has no TaxSubtotal or indicator).
+                -->
+                <cbc:TaxIncludedIndicator
+                    t-if="vals.get('tax_included_indicator') is not None and not vals.get('btae_20_aed_total')"
+                    t-out="vals.get('tax_included_indicator', 'false')"/>
+            </t>
+        </xpath>
+    </template>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         Common PINT AE line additions (Invoice and CreditNote lines)
+
+         Adds:
+           - AdditionalItemProperty for BTAE-09 (RC goods/services type)
+           - CommodityClassification/CommodityCode  (BTAE-13: G or S)
+           - CommodityClassification/ItemClassificationCode  (IBT-158: HS code)
+           - ItemPriceExtension/Amount              (BTAE-10: net line amount)
+           - ItemPriceExtension/TaxTotal/TaxAmount  (BTAE-08: per-line VAT)
+         ════════════════════════════════════════════════════════════════════════ -->
+    <template id="pint_ae_InvoiceLineType"
+              inherit_id="account_edi_ubl_cii.ubl_20_InvoiceLineType"
+              primary="True">
+
+        <!-- BTAE-09: AdditionalItemProperty for reverse-charge goods/services description -->
+        <!-- UBL 2.1 XSD sequence: AdditionalItemProperty (pos 24) comes AFTER ClassifiedTaxCategory (pos 23) -->
+        <xpath expr="//*[local-name()='Item']/*[local-name()='ClassifiedTaxCategory']"
+               position="after">
+            <t xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+               xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <cac:AdditionalItemProperty t-if="item_vals.get('btae_09_rc_description')">
+                    <cbc:Name>typeOfGoodsOrServices</cbc:Name>
+                    <cbc:Value t-out="item_vals['btae_09_rc_description']"/>
+                </cac:AdditionalItemProperty>
+            </t>
+        </xpath>
+
+        <!-- BTAE-13 / IBT-158: CommodityClassification elements in Item -->
+        <xpath expr="//*[local-name()='Item']/*[local-name()='ClassifiedTaxCategory']"
+               position="before">
+            <t xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+               xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <!--
+                  pint_ae_commodity_classifications is a list of dicts, each containing
+                  either {'commodity_code': 'G'|'S'} or {'item_classification_code': '...', ...}
+                -->
+                <t t-foreach="item_vals.get('pint_ae_commodity_classifications', [])"
+                   t-as="cc">
+                    <cac:CommodityClassification>
+                        <!-- BTAE-13: Goods or Services indicator -->
+                        <cbc:CommodityCode t-if="cc.get('commodity_code')"
+                                           t-out="cc['commodity_code']"/>
+                        <!-- IBT-158: HS / CPV code -->
+                        <cbc:ItemClassificationCode
+                            t-if="cc.get('item_classification_code')"
+                            t-att="cc.get('item_classification_code_attrs', {})"
+                            t-out="cc['item_classification_code']"/>
+                    </cac:CommodityClassification>
+                </t>
+            </t>
+        </xpath>
+
+        <!-- BTAE-10 / BTAE-08: ItemPriceExtension after Price -->
+        <xpath expr="//*[local-name()='Price']" position="after">
+            <t xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+               xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <t t-set="ipe" t-value="vals.get('item_price_extension_vals', {})"/>
+                <cac:ItemPriceExtension t-if="ipe">
+                    <!-- BTAE-10: net amount payable for this line -->
+                    <cbc:Amount
+                        t-att-currencyID="ipe['currency'].name"
+                        t-out="format_float(ipe.get('amount'), ipe.get('currency_dp'))"/>
+                    <!-- BTAE-08: per-line VAT amount -->
+                    <t t-set="ipe_tax" t-value="ipe.get('tax_total_vals', {})"/>
+                    <cac:TaxTotal t-if="ipe_tax">
+                        <cbc:TaxAmount
+                            t-att-currencyID="ipe_tax['currency'].name"
+                            t-out="format_float(ipe_tax.get('tax_amount'), ipe_tax.get('currency_dp'))"/>
+                    </cac:TaxTotal>
+                </cac:ItemPriceExtension>
+            </t>
+        </xpath>
+
+    </template>
+
+    <!-- CreditNote lines use the same additions -->
+    <template id="pint_ae_CreditNoteLineType"
+              inherit_id="account_edi_ubl_cii.ubl_20_CreditNoteLineType"
+              primary="True">
+
+        <!-- BTAE-09: AdditionalItemProperty -->
+        <!-- UBL 2.1 XSD sequence: AdditionalItemProperty (pos 24) comes AFTER ClassifiedTaxCategory (pos 23) -->
+        <xpath expr="//*[local-name()='Item']/*[local-name()='ClassifiedTaxCategory']"
+               position="after">
+            <t xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+               xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <cac:AdditionalItemProperty t-if="item_vals.get('btae_09_rc_description')">
+                    <cbc:Name>typeOfGoodsOrServices</cbc:Name>
+                    <cbc:Value t-out="item_vals['btae_09_rc_description']"/>
+                </cac:AdditionalItemProperty>
+            </t>
+        </xpath>
+
+        <!-- BTAE-13 / IBT-158: CommodityClassification -->
+        <xpath expr="//*[local-name()='Item']/*[local-name()='ClassifiedTaxCategory']"
+               position="before">
+            <t xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+               xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <t t-foreach="item_vals.get('pint_ae_commodity_classifications', [])"
+                   t-as="cc">
+                    <cac:CommodityClassification>
+                        <cbc:CommodityCode t-if="cc.get('commodity_code')"
+                                           t-out="cc['commodity_code']"/>
+                        <cbc:ItemClassificationCode
+                            t-if="cc.get('item_classification_code')"
+                            t-att="cc.get('item_classification_code_attrs', {})"
+                            t-out="cc['item_classification_code']"/>
+                    </cac:CommodityClassification>
+                </t>
+            </t>
+        </xpath>
+
+        <!-- BTAE-10 / BTAE-08: ItemPriceExtension -->
+        <xpath expr="//*[local-name()='Price']" position="after">
+            <t xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+               xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <t t-set="ipe" t-value="vals.get('item_price_extension_vals', {})"/>
+                <cac:ItemPriceExtension t-if="ipe">
+                    <cbc:Amount
+                        t-att-currencyID="ipe['currency'].name"
+                        t-out="format_float(ipe.get('amount'), ipe.get('currency_dp'))"/>
+                    <t t-set="ipe_tax" t-value="ipe.get('tax_total_vals', {})"/>
+                    <cac:TaxTotal t-if="ipe_tax">
+                        <cbc:TaxAmount
+                            t-att-currencyID="ipe_tax['currency'].name"
+                            t-out="format_float(ipe_tax.get('tax_amount'), ipe_tax.get('currency_dp'))"/>
+                    </cac:TaxTotal>
+                </cac:ItemPriceExtension>
+            </t>
+        </xpath>
+
+    </template>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         InvoiceType — adds UAE root-level elements over BIS3 / UBL 2.1
+         ════════════════════════════════════════════════════════════════════════ -->
+    <template id="pint_ae_InvoiceType"
+              inherit_id="account_edi_ubl_cii.ubl_21_InvoiceType"
+              primary="True">
+
+        <!-- BTAE-02: ProfileExecutionID after ProfileID -->
+        <xpath expr="//*[local-name()='ProfileID']" position="after">
+            <t xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <cbc:ProfileExecutionID t-if="vals.get('profile_execution_id')"
+                                        t-out="vals['profile_execution_id']"/>
+            </t>
+        </xpath>
+
+        <!-- IssueTime (IBT-168) after IssueDate -->
+        <xpath expr="//*[local-name()='IssueDate']" position="after">
+            <t xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <cbc:IssueTime t-if="vals.get('issue_time')"
+                               t-out="vals['issue_time']"/>
+            </t>
+        </xpath>
+
+        <!--
+          BTAE-04: TaxExchangeRate
+          BTAE-01: BuyerCustomerParty
+          Both go after AccountingCustomerParty.
+          Order: TaxExchangeRate → BuyerCustomerParty (per PINT AE sample XML).
+        -->
+        <xpath expr="//*[local-name()='AccountingCustomerParty']" position="after">
+            <t xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+               xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+
+                <!-- BTAE-04: TaxExchangeRate when invoice currency != AED -->
+                <cac:TaxExchangeRate t-if="vals.get('tax_exchange_rate')">
+                    <cbc:SourceCurrencyCode t-out="vals.get('tax_exchange_rate_currency_code')"/>
+                    <cbc:TargetCurrencyCode t-out="vals.get('tax_exchange_rate_base_currency_code', 'AED')"/>
+                    <cbc:CalculationRate t-out="vals.get('tax_exchange_rate')"/>
+                </cac:TaxExchangeRate>
+
+                <!-- BTAE-01: BuyerCustomerParty — buyer's internal reference ID -->
+                <cac:BuyerCustomerParty t-if="vals.get('buyer_customer_party_id')">
+                    <cac:Party>
+                        <cac:PartyIdentification>
+                            <cbc:ID t-out="vals['buyer_customer_party_id']"/>
+                        </cac:PartyIdentification>
+                    </cac:Party>
+                </cac:BuyerCustomerParty>
+
+            </t>
+        </xpath>
+
+        <!--
+          BTAE-20: The second TaxTotal in AED is handled automatically.
+          _get_invoice_tax_totals_vals_list appends an AED entry with btae_20_aed_total=True
+          to the tax_total_vals list. The base ubl_20_InvoiceType loop renders ALL entries
+          in tax_total_vals via pint_ae_TaxTotalType, which skips TaxIncludedIndicator
+          and TaxSubtotals for the AED entry. No extra xpath needed here.
+        -->
+
+    </template>
+
+    <!-- ════════════════════════════════════════════════════════════════════════
+         CreditNoteType — same root-level additions as InvoiceType, plus
+         BTAE-03 DiscrepancyResponse (mandatory for all UAE credit notes)
+         ════════════════════════════════════════════════════════════════════════ -->
+    <template id="pint_ae_CreditNoteType"
+              inherit_id="account_edi_ubl_cii.ubl_21_CreditNoteType"
+              primary="True">
+
+        <!-- BTAE-02: ProfileExecutionID -->
+        <xpath expr="//*[local-name()='ProfileID']" position="after">
+            <t xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <cbc:ProfileExecutionID t-if="vals.get('profile_execution_id')"
+                                        t-out="vals['profile_execution_id']"/>
+            </t>
+        </xpath>
+
+        <!-- IssueTime (IBT-168) -->
+        <xpath expr="//*[local-name()='IssueDate']" position="after">
+            <t xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <cbc:IssueTime t-if="vals.get('issue_time')"
+                               t-out="vals['issue_time']"/>
+            </t>
+        </xpath>
+
+        <!--
+          BTAE-03: DiscrepancyResponse — mandatory for all UAE credit notes.
+          Goes before AccountingSupplierParty per UBL 2.1 CreditNote XSD sequence.
+          ResponseCode MUST be from AE-CreditReason code list.
+        -->
+        <xpath expr="//*[local-name()='AccountingSupplierParty']" position="before">
+            <t xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+               xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+                <cac:DiscrepancyResponse t-if="vals.get('btae_03_reason')">
+                    <cbc:ResponseCode t-out="vals['btae_03_reason']"/>
+                </cac:DiscrepancyResponse>
+            </t>
+        </xpath>
+
+        <!-- BTAE-04 + BTAE-01 after AccountingCustomerParty -->
+        <xpath expr="//*[local-name()='AccountingCustomerParty']" position="after">
+            <t xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+               xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+
+                <cac:TaxExchangeRate t-if="vals.get('tax_exchange_rate')">
+                    <cbc:SourceCurrencyCode t-out="vals.get('tax_exchange_rate_currency_code')"/>
+                    <cbc:TargetCurrencyCode t-out="vals.get('tax_exchange_rate_base_currency_code', 'AED')"/>
+                    <cbc:CalculationRate t-out="vals.get('tax_exchange_rate')"/>
+                </cac:TaxExchangeRate>
+
+                <cac:BuyerCustomerParty t-if="vals.get('buyer_customer_party_id')">
+                    <cac:Party>
+                        <cac:PartyIdentification>
+                            <cbc:ID t-out="vals['buyer_customer_party_id']"/>
+                        </cac:PartyIdentification>
+                    </cac:Party>
+                </cac:BuyerCustomerParty>
+
+            </t>
+        </xpath>
+
+        <!--
+          BTAE-20: handled via pint_ae_TaxTotalType — see InvoiceType comment above.
+          No extra xpath needed in CreditNoteType either.
+        -->
+
+    </template>
+
+</odoo>
