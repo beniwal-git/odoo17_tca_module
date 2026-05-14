@@ -17,14 +17,19 @@ _get_ubl_cii_builder_from_xml_tree: PINT AE CustomizationID routed to our builde
 """
 
 import logging
+import re
+import uuid
 
 from odoo import _, api, fields, models
-from odoo.exceptions import UserError
+from odoo.exceptions import UserError, ValidationError
 
 _logger = logging.getLogger(__name__)
 
 # States that block cancellation (document is in-flight or completed)
-_CANCEL_BLOCKED_STATES = frozenset(['processing', 'delivered', 'received'])
+_CANCEL_BLOCKED_STATES = frozenset(['processing', 'delivered', 'buyer_confirmed'])
+
+# UAE Emirates codes (ibr-128-ae)
+_UAE_EMIRATES = ['AUH', 'DXB', 'SHJ', 'UAQ', 'FUJ', 'AJM', 'RAK']
 
 # BTAE-03: Credit note reason codes (AE-CreditReason code list per UAE VAT Decree-Law)
 CREDIT_NOTE_REASONS = [
@@ -66,7 +71,8 @@ class AccountMove(models.Model):
             ('submitted', 'Submitted to TCA'),
             ('processing', 'Processing (In Transit)'),
             ('delivered', 'Delivered to Buyer AP'),
-            ('received', 'Confirmed by Buyer'),
+            ('buyer_confirmed', 'Confirmed by Buyer'),
+            ('inbound_received', 'Received from Seller'),
             ('error', 'Error'),
             ('rejected', 'Rejected'),
             ('cancelled', 'Cancelled'),
@@ -82,7 +88,8 @@ class AccountMove(models.Model):
             'submitted: registered with TCA, workflow starting\n'
             'processing: TCA sending to Peppol C3 Access Point\n'
             'delivered: C3 confirmed delivery to buyer AP\n'
-            'received: buyer C5 confirmed receipt\n'
+            'buyer_confirmed: buyer C5 confirmed receipt (outbound terminal success)\n'
+            'inbound_received: document received from Peppol network (inbound)\n'
             'error: submission or delivery error — see chatter\n'
             'rejected: rejected by Peppol network or buyer AP'
         ),
@@ -99,12 +106,30 @@ class AccountMove(models.Model):
         readonly=True,
         help='Last error message received from TCA. Cleared on successful resubmission.',
     )
+    tca_last_submission_id = fields.Char(
+        string='Last TCA Submission ID',
+        copy=False,
+        readonly=True,
+        help='The invoice_number actually sent to TCA on the most recent attempt. '
+             'Per UAE FTA compliance, each submission must carry a unique ID; we '
+             'compose <record name>-<uuid8> per attempt. Differs from this '
+             'record\'s name — Odoo keeps the canonical invoice number, TCA tracks '
+             'each submission with its own ID.',
+    )
     tca_is_inbound = fields.Boolean(
         string='TCA Inbound',
         default=False,
         copy=False,
         readonly=True,
         help='True if this invoice was received via TCA Peppol (direction = RECEIVED).',
+    )
+
+    # Related: company.tca_is_active surfaced on the move so view conditions can
+    # reference it directly (Odoo view attrs cannot traverse Many2one chains).
+    tca_company_is_active = fields.Boolean(
+        related='company_id.tca_is_active',
+        readonly=True,
+        store=False,
     )
 
     # ── Inbound accept/reject ──────────────────────────────────────────────────
@@ -126,28 +151,231 @@ class AccountMove(models.Model):
         help='Reason for rejecting this inbound invoice. Logged in chatter.',
     )
 
+    # ── Buyer Participant ID ─────────────────────────────────────────────────
+
+    # PINT AE predefined endpoints (BIS Section 1.5.3, eas=0235).
+    # Used when the document does not need to reach a real Peppol receiver:
+    # the participant ID is overridden to one of these so TCA reports to C5
+    # (FTA platform) only.
+    _PREDEFINED_DEEMED = '9900000097'           # Deemed Supply (BTAE-02 pos 2 = 1)
+    _PREDEFINED_NOT_SUBJECT = '9900000098'      # Buyer not subject to UAE e-invoicing
+    _PREDEFINED_EXPORT_NO_PEPPOL = '9900000099' # Export, receiver not in Peppol (BTAE-02 pos 8 = 1)
+    # `1XXXXXXXXX` was the legacy placeholder used before BIS 1.5.3 was published.
+    # Treat it as equivalent to "anonymous / not-in-Peppol buyer" for backward compat.
+    _LEGACY_PLACEHOLDER_PARTICIPANT = '1XXXXXXXXX'
+    _ANON_BUYER_PIDS = frozenset((
+        _PREDEFINED_DEEMED,
+        _PREDEFINED_NOT_SUBJECT,
+        _PREDEFINED_EXPORT_NO_PEPPOL,
+        _LEGACY_PLACEHOLDER_PARTICIPANT,
+    ))
+    # Backward-compat alias — kept so external callers / docs using the old name still work.
+    _NON_UAE_DEFAULT_PARTICIPANT_ID = _LEGACY_PLACEHOLDER_PARTICIPANT
+
+    tca_buyer_participant_id = fields.Char(
+        string='Buyer Participant ID',
+        copy=True,
+        compute='_compute_tca_buyer_participant_id',
+        store=True,
+        readonly=False,
+        help=(
+            'Peppol Participant ID of the buyer (receiver of this invoice).\n'
+            'For UAE buyers: their Peppol Participant ID (10 digits) or full TRN (15 digits).\n'
+            'For non-UAE / out-of-scope cases, PINT AE BIS 1.5.3 mandates a predefined endpoint:\n'
+            '  9900000097 — Deemed Supply (BTAE-02 pos 2)\n'
+            '  9900000098 — Buyer not subject to UAE e-invoicing\n'
+            '  9900000099 — Export, receiver not registered in Peppol (BTAE-02 pos 8)\n'
+            'Auto-populated from the customer record + transaction flags; editable per invoice.'
+        ),
+    )
+
+    @api.model
+    def _tca_resolve_buyer_participant_id(self, partner, flags):
+        """
+        Apply BIS 1.5.3 routing to determine the Peppol Participant ID for a
+        buyer. Pure function — does NOT mutate any record. Called by both the
+        @api.depends compute below and the @api.onchange handler in this model,
+        so the routing rules live in exactly one place.
+
+        Routing precedence:
+          1. Deemed Supply flag set (BTAE-02 pos 2)         → 9900000097
+          2. UAE buyer                                      → peppol_endpoint (or '')
+          3. Foreign buyer + Export flag set (BTAE-02 pos 8)→ 9900000099
+          4. Foreign buyer (no special flag)                → 9900000098
+          5. Partner without country                        → ''
+
+        Args:
+            partner:  res.partner record (typically the commercial_partner_id)
+            flags:    8-char BTAE-02 binary string, e.g. '01000000' = Deemed Supply
+
+        Returns:
+            The resolved participant ID string. Never None.
+        """
+        flags = (flags or '00000000').ljust(8, '0')
+
+        # (1) Deemed Supply — predefined endpoint regardless of buyer
+        if flags[1] == '1':
+            return self._PREDEFINED_DEEMED
+
+        if not partner.country_id:
+            return ''
+
+        if partner.country_id.code == 'AE':
+            # (2) UAE buyer — 10-digit Peppol Participant ID only. Do NOT
+            # fall back to vat (TRN is a 15-digit tax identifier, not a
+            # Peppol routing endpoint). Missing endpoint surfaces at
+            # post-time validation.
+            return partner.peppol_endpoint or ''
+
+        if flags[7] == '1':
+            # (3) Export, receiver not registered in Peppol
+            return self._PREDEFINED_EXPORT_NO_PEPPOL
+        # (4) Foreign buyer not otherwise subject to UAE e-invoicing
+        return self._PREDEFINED_NOT_SUBJECT
+
+    @api.depends(
+        'partner_id', 'partner_id.peppol_endpoint', 'partner_id.country_id',
+        'tca_transaction_type_flags',
+    )
+    def _compute_tca_buyer_participant_id(self):
+        """
+        Auto-populate Buyer Participant ID per BIS 1.5.3. The compute
+        re-evaluates when flags or partner change ONLY if the current value
+        is a predefined/legacy endpoint (i.e. it was auto-set, not user-set).
+        Custom values entered by the user are preserved.
+
+        Actual routing logic lives in _tca_resolve_buyer_participant_id —
+        shared with the @api.onchange so the rules cannot drift.
+        """
+        for move in self:
+            current = (move.tca_buyer_participant_id or '').strip()
+            # Preserve user-set values (anything not in the auto-set predefined set).
+            if current and current not in self._ANON_BUYER_PIDS:
+                continue
+            partner = move.partner_id.commercial_partner_id
+            move.tca_buyer_participant_id = self._tca_resolve_buyer_participant_id(
+                partner, move.tca_transaction_type_flags,
+            )
+
     # ── PINT AE XML fields ────────────────────────────────────────────────────
+
+    # ── BTAE-02 transaction-type flag booleans (user-facing checkboxes) ──────
+    # These 7 booleans represent positions 1-7 of the BTAE-02 ProfileExecutionID
+    # binary string. Position 8 (Export) is auto-detected by the XML builder
+    # from the buyer's country — never user-set.
+    # tca_transaction_type_flags (below) is COMPUTED from these.
+
+    tca_flag_free_trade_zone = fields.Boolean(
+        string='Free Trade Zone (UC8)', copy=True,
+        help='Tick if the supply involves a UAE Free Trade Zone (BTAE-02 position 1).',
+    )
+    tca_flag_deemed_supply = fields.Boolean(
+        string='Deemed Supply (UC4)', copy=True,
+        help='Tick for deemed-supply scenarios (e.g. goods for own use). '
+             'BTAE-02 position 2. Buyer participant ID auto-switches to predefined endpoint 9900000097.',
+    )
+    tca_flag_margin_scheme = fields.Boolean(
+        string='Margin Scheme (UC11)', copy=True,
+        help='Tick for second-hand goods / margin-scheme transactions (BTAE-02 position 3).',
+    )
+    tca_flag_summary_invoice = fields.Boolean(
+        string='Summary Invoice (UC6)', copy=True,
+        help='Tick for an invoice consolidating multiple supplies over a period (BTAE-02 position 4). '
+             'Requires Invoice Period Start/End.',
+    )
+    tca_flag_continuous_supply = fields.Boolean(
+        string='Continuous Supply (UC7)', copy=True,
+        help='Tick for subscriptions / recurring supplies (BTAE-02 position 5). '
+             'Requires Invoice Period Start/End, Contract Reference, and Billing Frequency.',
+    )
+    tca_flag_disclosed_agent = fields.Boolean(
+        string='Disclosed Agent Billing (UC5)', copy=True,
+        help='Tick when invoicing as a disclosed agent on behalf of a principal '
+             '(BTAE-02 position 6). Requires Principal TRN.',
+    )
+    tca_flag_ecommerce = fields.Boolean(
+        string='E-commerce (UC9)', copy=True,
+        help='Tick for online-channel transactions (BTAE-02 position 7).',
+    )
+
+    # ── Section expand/collapse toggle ────────────────────────────────────────
+    # Acts as the "expand" switch for the Transaction Type (Optional) group.
+    # Auto-set to True whenever any flag above is on, so opening an existing
+    # invoice with flags already configured shows them expanded.
+    tca_show_special_flags = fields.Boolean(
+        string='Use Special Type',
+        compute='_compute_tca_show_special_flags',
+        store=True,
+        readonly=False,
+        copy=True,
+        help='Toggle on to reveal special transaction-type checkboxes. '
+             'Leave off for standard tax invoices (the most common case).',
+    )
+
+    @api.depends(
+        'tca_flag_free_trade_zone', 'tca_flag_deemed_supply',
+        'tca_flag_margin_scheme', 'tca_flag_summary_invoice',
+        'tca_flag_continuous_supply', 'tca_flag_disclosed_agent',
+        'tca_flag_ecommerce',
+    )
+    def _compute_tca_show_special_flags(self):
+        """Auto-expand the section whenever any flag is on. Preserves a
+        manual True so the user can keep it open with no flags ticked yet,
+        and preserves a manual False (the default) when no flag is on."""
+        for move in self:
+            if any((
+                move.tca_flag_free_trade_zone,
+                move.tca_flag_deemed_supply,
+                move.tca_flag_margin_scheme,
+                move.tca_flag_summary_invoice,
+                move.tca_flag_continuous_supply,
+                move.tca_flag_disclosed_agent,
+                move.tca_flag_ecommerce,
+            )):
+                move.tca_show_special_flags = True
+            elif not move.tca_show_special_flags:
+                # No flags AND not explicitly toggled on by the user.
+                move.tca_show_special_flags = False
 
     tca_transaction_type_flags = fields.Char(
         string='Transaction Type Flags (BTAE-02)',
         size=8,
-        default='00000000',
+        compute='_compute_tca_transaction_type_flags',
+        store=True,
         copy=True,
         help=(
-            'BTAE-02: 8-digit binary flag string for the PINT AE ProfileExecutionID.\n'
-            'Each position is 0 (false) or 1 (true):\n'
-            '  Pos 1: Free Trade Zone\n'
-            '  Pos 2: Deemed Supply\n'
-            '  Pos 3: Margin Scheme\n'
-            '  Pos 4: Summary Invoice\n'
-            '  Pos 5: Continuous Supply\n'
-            '  Pos 6: Disclosed Agent Billing\n'
-            '  Pos 7: E-commerce\n'
-            '  Pos 8: Exports\n'
-            'Standard domestic B2B/Reverse Charge/Zero-Rated = "00000000".\n'
-            'Export = "00000001", Deemed Supply = "01000000".'
+            'BTAE-02: 8-digit binary flag string for the PINT AE ProfileExecutionID. '
+            'Composed automatically from the seven flag checkboxes above (positions 1-7); '
+            'position 8 (Export) is auto-set in the XML output when the buyer is non-UAE. '
+            '"00000000" = standard tax invoice.'
         ),
     )
+
+    @api.depends(
+        'tca_flag_free_trade_zone',
+        'tca_flag_deemed_supply',
+        'tca_flag_margin_scheme',
+        'tca_flag_summary_invoice',
+        'tca_flag_continuous_supply',
+        'tca_flag_disclosed_agent',
+        'tca_flag_ecommerce',
+    )
+    def _compute_tca_transaction_type_flags(self):
+        """Compose the 8-char BTAE-02 string from the 7 user-facing booleans.
+        The export bit (position 8) is always '0' here — the XML builder forces
+        it to '1' when the buyer's country is not AE."""
+        for move in self:
+            move.tca_transaction_type_flags = ''.join((
+                '1' if move.tca_flag_free_trade_zone else '0',
+                '1' if move.tca_flag_deemed_supply else '0',
+                '1' if move.tca_flag_margin_scheme else '0',
+                '1' if move.tca_flag_summary_invoice else '0',
+                '1' if move.tca_flag_continuous_supply else '0',
+                '1' if move.tca_flag_disclosed_agent else '0',
+                '1' if move.tca_flag_ecommerce else '0',
+                '0',  # Export — auto-set by XML builder
+            ))
+
     tca_credit_note_reason = fields.Selection(
         selection=CREDIT_NOTE_REASONS,
         string='Credit Note Reason (BTAE-03)',
@@ -159,27 +387,667 @@ class AccountMove(models.Model):
             'preceding invoice reference (IBG-03).'
         ),
     )
+
+    # ── Derived booleans for view visibility (kept for backward compat) ──────
+    # These now delegate to the new user-facing flag booleans. View conditions
+    # can use either the derived ones or the new flag fields directly.
+    tca_is_agent_billing = fields.Boolean(
+        compute='_compute_tca_derived_flag_booleans', string='Is Agent Billing',
+    )
+    tca_is_summary_or_continuous = fields.Boolean(
+        compute='_compute_tca_derived_flag_booleans',
+    )
+    tca_is_continuous = fields.Boolean(
+        compute='_compute_tca_derived_flag_booleans',
+    )
+    # tca_is_export now derives from buyer country (export auto-detected)
+    tca_is_export = fields.Boolean(compute='_compute_tca_is_export')
+    tca_buyer_is_uae = fields.Boolean(compute='_compute_tca_buyer_is_uae')
+
+    @api.depends(
+        'tca_flag_disclosed_agent', 'tca_flag_summary_invoice',
+        'tca_flag_continuous_supply',
+    )
+    def _compute_tca_derived_flag_booleans(self):
+        for move in self:
+            move.tca_is_agent_billing = move.tca_flag_disclosed_agent
+            move.tca_is_continuous = move.tca_flag_continuous_supply
+            move.tca_is_summary_or_continuous = (
+                move.tca_flag_summary_invoice or move.tca_flag_continuous_supply
+            )
+
+    @api.depends('partner_id', 'partner_id.country_id')
+    def _compute_tca_is_export(self):
+        """Export is determined by the buyer's country, not by a user flag.
+        Foreign buyer ⇒ export ⇒ Export Declaration Number field becomes visible."""
+        for move in self:
+            partner = move.partner_id.commercial_partner_id
+            move.tca_is_export = bool(
+                partner and partner.country_id and partner.country_id.code != 'AE'
+            )
+
+    @api.depends('partner_id', 'partner_id.commercial_partner_id.country_id')
+    def _compute_tca_buyer_is_uae(self):
+        for move in self:
+            partner = move.partner_id.commercial_partner_id
+            move.tca_buyer_is_uae = bool(partner.country_id and partner.country_id.code == 'AE')
+
     tca_principal_id = fields.Char(
         string='Principal TRN (BTAE-14)',
-        copy=False,
+        copy=True,
         help=(
             'BTAE-14: Tax Registration Number of the Principal in a Disclosed Agent Billing '
             'arrangement (UC5 / UC13).\n'
-            'Mandatory when BTAE-02 position 6 = 1 (Disclosed Agent flag set).'
+            'Mandatory when BTAE-02 position 6 = 1 (Disclosed Agent flag set).\n'
+            'Carried over to credit notes — same principal usually applies.'
         ),
     )
+    # ── Invoice Type Code (6 PINT AE variants) ───────────────────────────────
+    # `_sb` suffix = self-billing (buyer issues on behalf of supplier).
+    # XML emits the bare UNCL1001 code (380/381/480/81) via tca_uncl1001_code;
+    # the self-billing variants only differ in CustomizationID/ProfileID.
+
+    _TYPE_INVOICE_TO_REFUND = {'380': '381', '380_sb': '381_sb', '480': '81'}
+    _TYPE_REFUND_TO_INVOICE = {'381': '380', '381_sb': '380_sb', '81': '480'}
+
+    tca_invoice_type_code = fields.Selection(
+        selection=[
+            ('380', '380 — Tax Invoice'),
+            ('381', '381 — Tax Credit Note'),
+            ('380_sb', 'Self-Billing Tax Invoice'),
+            ('381_sb', 'Self-Billing Tax Credit Note'),
+            ('480', '480 — Out-of-Scope Invoice'),
+            ('81', '81 — Out-of-Scope Credit Note'),
+        ],
+        string='Invoice Type Code',
+        compute='_compute_tca_invoice_type_code',
+        store=True,
+        readonly=False,
+        copy=True,
+        help=(
+            'PINT AE invoice type code.\n'
+            '380: Tax Invoice — standard sale with UAE VAT\n'
+            '381: Tax Credit Note — reverses a 380\n'
+            'Self-Billing Tax Invoice: buyer issues 380 on behalf of supplier (UC4)\n'
+            'Self-Billing Tax Credit Note: buyer issues 381 on behalf of supplier (UC5)\n'
+            '480: Out-of-Scope Invoice — not subject to UAE VAT\n'
+            '81: Out-of-Scope Credit Note — reverses a 480\n'
+            'Self-billing variants emit the standard 380/381 UNCL1001 code with '
+            'the urn:peppol:pint:selfbilling-1@ae-1 customization.'
+        ),
+    )
+
+    tca_uncl1001_code = fields.Char(
+        compute='_compute_tca_uncl1001_code',
+        store=False,
+        string='UNCL1001 Code',
+        help='Actual UNCL1001 document type code emitted in the XML (380/381/480/81). '
+             'Strips the _sb suffix from self-billing variants.',
+    )
+
+    # ── User-facing OOS toggle ────────────────────────────────────────────────
+    # Drives _compute_tca_invoice_type_code: when ticked, the resolved code
+    # flips to 480 (Commercial Invoice) for invoices or 81 (OOS Credit Note)
+    # for refunds. Default off — most invoices are Tax Invoices subject to
+    # UAE VAT. Shown on the invoice form; hidden / readonly for inbound moves
+    # (the OOS classification of a received document is fixed by the seller).
     tca_is_out_of_scope = fields.Boolean(
-        string='Out of Scope Supply (UAE)',
+        string='Out of Scope (Commercial Invoice)',
         default=False,
+        copy=True,
+        help='Tick to issue a Commercial Invoice — a document NOT subject to '
+             'UAE VAT (PINT AE code 480, or 81 for credit notes). '
+             'Examples: financial services, supplies outside the UAE VAT scope, '
+             'transactions with non-residents. Leave unticked for standard Tax '
+             'Invoices (codes 380 / 381).',
+    )
+
+    @api.onchange('tca_is_out_of_scope')
+    def _onchange_tca_is_out_of_scope(self):
+        """
+        When the user ticks "Out of Scope":
+
+          (1) Clear forbidden BTAE-02 flags. PINT AE ibr-157-ae: Out-of-Scope
+              documents cannot also be Deemed Supply / Margin Scheme / Summary
+              Invoice. The form hides those checkboxes when OOS is on, but the
+              user might have ticked one BEFORE turning OOS on.
+
+          (2) Strip forbidden line taxes. An OOS invoice is outside the UAE
+              VAT regime, so it cannot carry standard-rate (S) or
+              reverse-charge (AE) taxes — these would force Odoo to post VAT
+              entries the law says don't exist. We strip any tax that is
+              explicitly S/AE OR has a non-zero percent rate (catches
+              uncategorized 5% taxes).
+
+          (3) Auto-apply an Out-of-Scope tax on lines left without taxes.
+              PINT AE rule ibr-sr-58 makes line tax category MANDATORY; for
+              OOS documents the required value is 'O'. Search the company
+              for a tax with tca_tax_category='O' and 0% rate matching the
+              move's direction (sale / purchase); apply it to product lines
+              that have no tax. If no OOS tax is configured, surface a clear
+              warning telling the user to set one up.
+
+          A single warning dialog summarizes all three actions.
+        """
+        if not self.tca_is_out_of_scope:
+            return
+
+        # ── (1) Forbidden BTAE-02 flags ──────────────────────────────────────
+        self.tca_flag_deemed_supply = False
+        self.tca_flag_margin_scheme = False
+        self.tca_flag_summary_invoice = False
+
+        # ── (2) Strip forbidden taxes ────────────────────────────────────────
+        def _is_forbidden_for_oos(tax):
+            cat = (getattr(tax, 'tca_tax_category', '') or '')
+            if cat in ('S', 'AE'):
+                return True
+            return tax.amount_type == 'percent' and tax.amount != 0.0
+
+        removed_per_line = []
+        for line in self.invoice_line_ids.filtered(lambda l: l.display_type == 'product'):
+            forbidden = line.tax_ids.filtered(_is_forbidden_for_oos)
+            if not forbidden:
+                continue
+            label = line.name or (line.product_id and line.product_id.name) or _('(unnamed line)')
+            removed_per_line.append(
+                '%s — %s' % (label, ', '.join(forbidden.mapped('name')))
+            )
+            line.tax_ids = line.tax_ids - forbidden
+
+        # ── (3) Auto-apply OOS tax to lines without any tax remaining ───────
+        # Lines that still carry a (now zero-rated / exempt) tax are left
+        # alone — the user's existing setup is assumed valid. The OOS tax is
+        # auto-created in the company's chart if missing.
+        type_tax_use = 'sale' if self.move_type in ('out_invoice', 'out_refund') else 'purchase'
+        oos_tax = self.env['account.tax']._tca_ensure_oos_tax(self.company_id, type_tax_use)
+
+        applied_to_lines = []
+        for line in self.invoice_line_ids.filtered(lambda l: l.display_type == 'product'):
+            if line.tax_ids:
+                continue  # Has a tax already (must be zero-rated/exempt after strip) — keep
+            line.tax_ids = oos_tax
+            label = line.name or (line.product_id and line.product_id.name) or _('(unnamed line)')
+            applied_to_lines.append(label)
+
+        # ── Assemble single combined warning if any of the three acted ──────
+        sections = []
+        if removed_per_line:
+            sections.append(_(
+                'Removed taxes (UAE FTA: Out-of-Scope invoices cannot carry VAT):\n%s',
+                '\n'.join(f'  • {r}' for r in removed_per_line),
+            ))
+        if applied_to_lines:
+            sections.append(_(
+                'Auto-applied "%(name)s" (Out-of-Scope, 0%% rate, category O) to '
+                'satisfy PINT AE rule ibr-sr-58 (line tax category is mandatory):\n%(list)s',
+                name=oos_tax.name,
+                list='\n'.join(f'  • {label}' for label in applied_to_lines),
+            ))
+
+        if sections:
+            return {
+                'warning': {
+                    'title': _('Tax adjustments for Out-of-Scope invoice'),
+                    'message': '\n\n'.join(sections),
+                }
+            }
+
+    # Computed booleans for view visibility (Odoo 17 cannot do slice/in on Selection in invisible)
+    tca_show_credit_note_fields = fields.Boolean(
+        compute='_compute_tca_type_visibility', store=False,
+    )
+    tca_is_out_of_scope_type = fields.Boolean(
+        compute='_compute_tca_type_visibility', store=False,
+    )
+
+    @api.depends('move_type', 'tca_is_out_of_scope')
+    def _compute_tca_invoice_type_code(self):
+        """
+        Resolve the PINT AE document type code from the move's direction plus
+        the user-facing OOS toggle:
+
+            (out_invoice / in_invoice, not OOS) → '380'  Tax Invoice
+            (out_invoice / in_invoice,     OOS) → '480'  Commercial Invoice (OOS)
+            (out_refund  / in_refund,  not OOS) → '381'  Tax Credit Note
+            (out_refund  / in_refund,      OOS) → '81'   OOS Credit Note
+
+        Self-billing variants ('380_sb', '381_sb') aren't user-exposed and are
+        preserved if already set (set via dev mode / data import / future UI).
+
+        Inbound moves are not touched — their type code is set by the XML
+        importer from the actual `<cbc:InvoiceTypeCode>` / `<CreditNoteTypeCode>`
+        carried in the received document, and the OOS classification is a
+        property of the seller's invoice, not something the buyer can flip.
+        """
+        for move in self:
+            # Inbound: importer is the source of truth — don't recompute.
+            if move.tca_is_inbound:
+                continue
+            # Preserve self-billing variants (no _sb checkbox UI yet).
+            if move.tca_invoice_type_code in ('380_sb', '381_sb'):
+                continue
+
+            if move.move_type in ('out_invoice', 'in_invoice'):
+                move.tca_invoice_type_code = '480' if move.tca_is_out_of_scope else '380'
+            elif move.move_type in ('out_refund', 'in_refund'):
+                move.tca_invoice_type_code = '81' if move.tca_is_out_of_scope else '381'
+            else:
+                move.tca_invoice_type_code = False
+
+    @api.depends('tca_invoice_type_code')
+    def _compute_tca_uncl1001_code(self):
+        for move in self:
+            code = move.tca_invoice_type_code or ''
+            move.tca_uncl1001_code = code[:-3] if code.endswith('_sb') else (code or False)
+
+    @api.depends('tca_invoice_type_code')
+    def _compute_tca_type_visibility(self):
+        for move in self:
+            code = move.tca_invoice_type_code or ''
+            move.tca_show_credit_note_fields = code in ('381', '381_sb', '81')
+            move.tca_is_out_of_scope_type = code in ('480', '81')
+
+    @api.onchange('tca_invoice_type_code')
+    def _onchange_tca_invoice_type_code(self):
+        """Prevent mismatched type codes (e.g. credit note code on an invoice)."""
+        code = self.tca_invoice_type_code
+        if not code or not self.move_type:
+            return
+        is_refund = self.move_type in ('out_refund', 'in_refund')
+        if is_refund and code in self._TYPE_INVOICE_TO_REFUND:
+            self.tca_invoice_type_code = self._TYPE_INVOICE_TO_REFUND[code]
+            return {'warning': {
+                'title': _('Invalid Type Code'),
+                'message': _('Credit notes cannot use an invoice type code. Reset to %s.', self.tca_invoice_type_code),
+            }}
+        if not is_refund and code in self._TYPE_REFUND_TO_INVOICE:
+            self.tca_invoice_type_code = self._TYPE_REFUND_TO_INVOICE[code]
+            return {'warning': {
+                'title': _('Invalid Type Code'),
+                'message': _('Invoices cannot use a credit note type code. Reset to %s.', self.tca_invoice_type_code),
+            }}
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        """
+        EXTENDS account.move.
+        Defensive flip: when the create vals carry both move_type and an
+        opposite-pair tca_invoice_type_code (e.g. Odoo's reversal wizard copies
+        '380' from the original invoice into a new out_refund), auto-flip the
+        type code so it matches the move_type direction.
+
+        The @api.depends('move_type') compute can't handle this on its own:
+        Odoo preserves explicit values for readonly=False compute-stored fields
+        during create — the recompute is skipped when the field is supplied
+        directly in the create vals.
+        """
+        for vals in vals_list:
+            move_type = vals.get('move_type')
+            type_code = vals.get('tca_invoice_type_code')
+            if not move_type or not type_code:
+                continue
+            is_refund = move_type in ('out_refund', 'in_refund')
+            if is_refund and type_code in self._TYPE_INVOICE_TO_REFUND:
+                vals['tca_invoice_type_code'] = self._TYPE_INVOICE_TO_REFUND[type_code]
+            elif not is_refund and type_code in self._TYPE_REFUND_TO_INVOICE:
+                vals['tca_invoice_type_code'] = self._TYPE_REFUND_TO_INVOICE[type_code]
+        return super().create(vals_list)
+
+    tca_is_self_billing = fields.Boolean(
+        string='Self-Billing (UC4/UC5)',
+        compute='_compute_tca_is_self_billing',
+        store=True,
+        copy=True,
+        help=(
+            'UC4/UC5: True when invoice type is a self-billing variant — '
+            'buyer issues the invoice on behalf of the supplier. '
+            'Derived from tca_invoice_type_code (the _sb variants).\n'
+            'Sets CustomizationID to selfbilling variant and ProfileID to selfbilling in PINT AE XML.'
+        ),
+    )
+
+    @api.depends('tca_invoice_type_code')
+    def _compute_tca_is_self_billing(self):
+        for move in self:
+            move.tca_is_self_billing = (move.tca_invoice_type_code or '').endswith('_sb')
+    tca_contract_value = fields.Char(
+        string='Contract Value (BTAE-05)',
+        copy=True,
+        help=(
+            'BTAE-05: Contract value description for ContractDocumentReference/DocumentDescription.\n'
+            'Example: "AED 1000000". Used in Continuous Supply (UC11) invoices.'
+        ),
+    )
+    tca_billing_frequency = fields.Selection(
+        selection=[
+            ('DLY', 'Daily'),
+            ('WKY', 'Weekly'),
+            ('Q15', 'Once in 15 days'),
+            ('MTH', 'Monthly'),
+            ('Q45', 'Once in 45 days'),
+            ('Q60', 'Once in 60 days'),
+            ('QTR', 'Quarterly'),
+            ('YRL', 'Yearly'),
+            ('HYR', 'Half-Yearly'),
+            ('OTH', 'Others'),
+        ],
+        string='Billing Frequency (BTAE-06)',
+        copy=True,
+        help=(
+            'BTAE-06: Frequency of billing for Continuous Supply (UC11) invoices.\n'
+            'Rendered as InvoicePeriod/Description. When "OTH", an Invoice Note is required.\n'
+            'Carried over to credit notes for Continuous Supply.'
+        ),
+    )
+    tca_export_declaration_number = fields.Char(
+        string='Export Declaration No. (BTAE-21)',
+        copy=True,
+        help=(
+            'BTAE-21: Export declaration number for Exports (UC14).\n'
+            'Rendered as StatementDocumentReference/ID.\n'
+            'Carried over to export credit notes — same declaration usually applies.'
+        ),
+    )
+    tca_incoterms = fields.Char(
+        string='Incoterms (BTAE-22)',
+        size=3,
+        copy=True,
+        help=(
+            'BTAE-22: Incoterms code for Exports (UC14).\n'
+            'Rendered as Delivery/DeliveryTerms/ID with schemeID="Incoterms".\n'
+            'Example: CIF, FOB, EXW.'
+        ),
+    )
+
+    # ── Missing PINT AE fields (document level) ─────────────────────────────
+
+    tca_buyer_reference = fields.Char(
+        string='Buyer Reference (IBT-010)',
+        copy=True,
+        help='IBT-010: A reference assigned by the buyer (e.g. purchase order number). '
+             'Carried over to credit notes — the same PO usually applies.',
+    )
+    tca_project_reference = fields.Char(
+        string='Project Reference (IBT-011)',
+        copy=True,
+        help='IBT-011: Identifier of the project the invoice relates to.',
+    )
+    tca_contract_reference = fields.Char(
+        string='Contract Reference (IBT-012)',
+        copy=True,
+        help='IBT-012: Identifier of the contract the invoice relates to.',
+    )
+    tca_buyer_accounting_ref = fields.Char(
+        string='Buyer Accounting Ref (IBT-019)',
+        copy=True,
+        help='IBT-019: A reference used by the buyer for internal accounting routing.',
+    )
+    tca_tax_point_date = fields.Date(
+        string='Tax Point Date (IBT-007)',
+        copy=False,
+        help='IBT-007: Date when VAT becomes applicable (if different from invoice date).',
+    )
+    tca_invoice_period_start = fields.Date(
+        string='Invoice Period Start (IBT-073)',
+        copy=False,
+        help='IBT-073: Start date of the invoicing period. Required for Summary/Continuous invoices.',
+    )
+    tca_invoice_period_end = fields.Date(
+        string='Invoice Period End (IBT-074)',
+        copy=False,
+        help='IBT-074: End date of the invoicing period. Required for Summary/Continuous invoices.',
+    )
+    tca_delivery_date = fields.Date(
+        string='Delivery Date (IBT-072)',
+        copy=False,
+        help='IBT-072: Actual delivery date of goods or services.',
+    )
+    tca_delivery_party_trn = fields.Char(
+        string='Deliver-to Party TRN (BTAE-23)',
+        copy=True,
+        help='BTAE-23: TRN/TIN of the delivery recipient (for triangular sales).',
+    )
+
+    # ── Buyer Emirate (per invoice override) ──────────────────────────────────
+
+    tca_buyer_emirate = fields.Selection(
+        selection=[(e, e) for e in _UAE_EMIRATES],
+        string='Buyer Emirate',
+        compute='_compute_tca_buyer_emirate',
+        store=True,
+        readonly=False,
         copy=False,
         help=(
-            'UC14: When True, sets invoice type code to 480 (Out of Scope invoice) '
-            'instead of 380, or 81 instead of 381 for credit notes.\n'
-            'Use for supplies not subject to UAE VAT (e.g. financial services, bare land).\n'
-            'When Out of Scope: IBT-031-1 tax scheme = "IVAT" and only VAT categories '
-            'E or O are permitted on invoice lines.'
+            'UAE emirate of the buyer (CountrySubentity, ibr-128-ae). '
+            'Auto-fills from the customer record when set; editable per invoice. '
+            'Mandatory when the buyer country is UAE.'
         ),
     )
+
+    # ── Format constraints ────────────────────────────────────────────────────
+
+    _RE_TRN_15 = re.compile(r'^\d{15}$')
+    _RE_FLAGS_8 = re.compile(r'^[01]{8}$')
+    # Backward-compat alias for any external code that still references this name.
+    _NON_UAE_PARTICIPANT_PLACEHOLDER = _LEGACY_PLACEHOLDER_PARTICIPANT
+
+    @api.constrains('tca_buyer_participant_id', 'partner_id')
+    def _check_tca_buyer_participant_id_format(self):
+        # UAE Peppol Participant ID — strictly 10 digits starting with "1".
+        # The 15-digit TRN is a separate identifier (PartyTaxScheme/CompanyID),
+        # not a Peppol endpoint.
+        # The 3 PINT AE predefined endpoints (BIS 1.5.3, 9900000097/98/99) start
+        # with "99" so they don't match the regex — they bypass this check via
+        # the _ANON_BUYER_PIDS set.
+        re_uae_format = re.compile(r'^1[0-9]{9}$')
+        for move in self:
+            pid = (move.tca_buyer_participant_id or '').strip()
+            if not pid or pid in self._ANON_BUYER_PIDS:
+                continue
+            partner = move.partner_id.commercial_partner_id
+            # Only enforce UAE format when buyer is in UAE
+            if not (partner.country_id and partner.country_id.code == 'AE'):
+                continue
+            if not re_uae_format.match(pid):
+                raise ValidationError(_(
+                    '"Buyer Participant ID" for UAE customers must be either:\n'
+                    '  • 10-digit Peppol Participant ID: starts with 1 (e.g. 1234567890), or\n'
+                    '  • One of the PINT AE predefined endpoints (9900000097/98/99).\n'
+                    'The 15-digit TRN goes in the customer\'s "Tax ID" field, not here.\n'
+                    'Current: "%s".',
+                    pid,
+                ))
+
+    @api.constrains('tca_transaction_type_flags')
+    def _check_tca_transaction_type_flags_format(self):
+        for move in self:
+            flags = (move.tca_transaction_type_flags or '').strip()
+            if not flags:
+                continue  # required-check handled at posting
+            if not self._RE_FLAGS_8.match(flags):
+                raise ValidationError(_(
+                    '"Transaction Type Flags" must be exactly 8 digits, each 0 or 1. '
+                    'Example: "00000000" for standard, "00000001" for export. Current: "%s".',
+                    flags,
+                ))
+
+    @api.constrains('tca_principal_id')
+    def _check_tca_principal_id_format(self):
+        for move in self:
+            pid = (move.tca_principal_id or '').strip()
+            if not pid:
+                continue
+            if not self._RE_TRN_15.match(pid):
+                raise ValidationError(_(
+                    '"Principal TRN" must be exactly 15 digits. Current: "%s".', pid,
+                ))
+
+    @api.constrains('tca_delivery_party_trn')
+    def _check_tca_delivery_party_trn_format(self):
+        for move in self:
+            trn = (move.tca_delivery_party_trn or '').strip()
+            if not trn:
+                continue
+            if not self._RE_TRN_15.match(trn):
+                raise ValidationError(_(
+                    '"Deliver-to Party TRN" must be exactly 15 digits. Current: "%s".', trn,
+                ))
+
+    @api.depends('partner_id', 'partner_id.tca_emirate', 'partner_id.state_id')
+    def _compute_tca_buyer_emirate(self):
+        for move in self:
+            if move.tca_buyer_emirate:
+                continue  # user-set or previously computed — preserve
+            partner = move.partner_id.commercial_partner_id
+            emirate = (
+                getattr(partner, 'tca_emirate', '')
+                or (partner.state_id and partner.state_id.code)
+                or ''
+            )
+            if emirate in _UAE_EMIRATES:
+                move.tca_buyer_emirate = emirate
+
+    # ── Buyer Legal Registration (per invoice override) ──────────────────────
+
+    tca_buyer_legal_id_type = fields.Selection(
+        selection=[
+            ('TL', 'Trade License (Commercial)'),
+            ('EID', 'Emirates ID'),
+            ('PAS', 'Passport'),
+            ('CD', 'Cabinet Decision'),
+        ],
+        string='Buyer Legal ID Type (BTAE-16)',
+        compute='_compute_tca_buyer_legal_fields',
+        store=True,
+        readonly=False,
+        copy=False,
+        help=(
+            'Type of buyer legal registration document. '
+            'Auto-fills from the customer record; editable per invoice. '
+            'TL=Trade License, EID=Emirates ID, PAS=Passport, CD=Cabinet Decision.'
+        ),
+    )
+    tca_buyer_trade_license = fields.Char(
+        string='Buyer Trade License / Reg. ID (IBT-047)',
+        compute='_compute_tca_buyer_legal_fields',
+        store=True,
+        readonly=False,
+        copy=False,
+        help=(
+            'Buyer legal registration identifier (Trade License / Emirates ID / Passport / CD ref). '
+            'Auto-fills from the customer record; editable per invoice.'
+        ),
+    )
+    tca_buyer_legal_authority = fields.Char(
+        string='Buyer Issuing Authority (BTAE-11)',
+        compute='_compute_tca_buyer_legal_fields',
+        store=True,
+        readonly=False,
+        copy=False,
+        help=(
+            'Issuing authority for the buyer Trade License (e.g. "DED - Dubai"). '
+            'Mandatory when Buyer Legal ID Type is TL. Auto-fills from customer record.'
+        ),
+    )
+    tca_buyer_passport_country_id = fields.Many2one(
+        'res.country',
+        string='Buyer Passport Country (BTAE-19)',
+        compute='_compute_tca_buyer_legal_fields',
+        store=True,
+        readonly=False,
+        copy=False,
+        help=(
+            'Country that issued the buyer passport. '
+            'Mandatory when Buyer Legal ID Type is PAS. Auto-fills from customer record.'
+        ),
+    )
+
+    @api.depends(
+        'partner_id',
+        'partner_id.tca_legal_id_type',
+        'partner_id.tca_trade_license',
+        'partner_id.tca_legal_authority',
+        'partner_id.tca_passport_country_id',
+        'partner_id.company_registry',
+        'partner_id.vat',
+    )
+    def _compute_tca_buyer_legal_fields(self):
+        for move in self:
+            partner = move.partner_id.commercial_partner_id
+            # Each field: don't overwrite if user already set on this invoice
+            if not move.tca_buyer_legal_id_type and partner.tca_legal_id_type:
+                move.tca_buyer_legal_id_type = partner.tca_legal_id_type
+            if not move.tca_buyer_trade_license:
+                move.tca_buyer_trade_license = (
+                    partner.tca_trade_license
+                    or partner.company_registry
+                    or partner.vat
+                    or False
+                )
+            if not move.tca_buyer_legal_authority and partner.tca_legal_authority:
+                move.tca_buyer_legal_authority = partner.tca_legal_authority
+            if not move.tca_buyer_passport_country_id and partner.tca_passport_country_id:
+                move.tca_buyer_passport_country_id = partner.tca_passport_country_id
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ONCHANGE: ensure TCA buyer fields populate immediately when the partner
+    # is set in the form — including the case where the partner was just
+    # created via the Many2one "Save & Close" popup, where the @api.depends
+    # compute chain occasionally fails to fire against fresh related data.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @api.onchange('partner_id')
+    def _onchange_partner_id_tca(self):
+        """
+        Mirror the partner-derived compute logic as an explicit onchange.
+        Runs in the form UI on every partner_id change, so values appear
+        without needing the user to re-select the customer.
+
+        Preserves user-edited values on the invoice (only fills empty fields).
+        """
+        if not self.partner_id:
+            return
+
+        partner = self.partner_id.commercial_partner_id
+
+        # ── Buyer Participant ID (BIS 1.5.3 routing) ──────────────────────────
+        # Same routing as the compute — both delegate to the shared helper
+        # so the rules live in one place and cannot drift apart.
+        current_pid = (self.tca_buyer_participant_id or '').strip()
+        if not current_pid or current_pid in self._ANON_BUYER_PIDS:
+            resolved = self._tca_resolve_buyer_participant_id(
+                partner, self.tca_transaction_type_flags,
+            )
+            # Preserve a previously-set non-empty value if the helper returns ''
+            # (e.g. partner has no country yet — common during draft creation).
+            if resolved or not current_pid:
+                self.tca_buyer_participant_id = resolved
+
+        # ── Buyer Emirate ─────────────────────────────────────────────────────
+        if not self.tca_buyer_emirate:
+            emirate = (
+                getattr(partner, 'tca_emirate', '')
+                or (partner.state_id and partner.state_id.code)
+                or ''
+            )
+            if emirate in _UAE_EMIRATES:
+                self.tca_buyer_emirate = emirate
+
+        # ── Buyer Legal fields ────────────────────────────────────────────────
+        if not self.tca_buyer_legal_id_type and partner.tca_legal_id_type:
+            self.tca_buyer_legal_id_type = partner.tca_legal_id_type
+        if not self.tca_buyer_trade_license:
+            self.tca_buyer_trade_license = (
+                partner.tca_trade_license
+                or partner.company_registry
+                or partner.vat
+                or False
+            )
+        if not self.tca_buyer_legal_authority and partner.tca_legal_authority:
+            self.tca_buyer_legal_authority = partner.tca_legal_authority
+        if not self.tca_buyer_passport_country_id and partner.tca_passport_country_id:
+            self.tca_buyer_passport_country_id = partner.tca_passport_country_id
 
     # ──────────────────────────────────────────────────────────────────────────
     # COMPUTED HELPERS
@@ -211,8 +1079,7 @@ class AccountMove(models.Model):
         """
         EXTENDS account.move.
         Block cancellation if any invoice is processing, delivered, or received.
-        The Peppol document is legally binding once submitted to the network.
-        To retract a sent invoice, a credit note must be issued.
+        For non-blocked invoices, set tca_move_state to 'cancelled'.
         """
         blocked = self.filtered(lambda m: m.tca_move_state in _CANCEL_BLOCKED_STATES)
         if blocked:
@@ -223,12 +1090,17 @@ class AccountMove(models.Model):
                 'To correct an error, issue a credit note instead.',
                 names
             ))
+        # Mark non-submitted invoices as cancelled in TCA state
+        for move in self:
+            if move.tca_move_state in ('not_sent', 'error', 'rejected', 'uploading', 'submitted', 'inbound_received'):
+                move.tca_move_state = 'cancelled'
         return super().button_cancel()
 
     def button_draft(self):
         """
         EXTENDS account.move.
-        Block reset-to-draft for the same reason as cancel.
+        Block reset-to-draft for in-flight/completed invoices.
+        Reset TCA state to 'not_sent' for error/rejected invoices.
         """
         blocked = self.filtered(lambda m: m.tca_move_state in _CANCEL_BLOCKED_STATES)
         if blocked:
@@ -239,7 +1111,582 @@ class AccountMove(models.Model):
                 'Issue a credit note to correct any errors.',
                 names
             ))
-        return super().button_draft()
+        result = super().button_draft()
+        # Reset TCA state so the invoice is eligible for re-submission after fixing
+        for move in self:
+            if move.tca_move_state in ('error', 'rejected', 'cancelled', 'not_sent'):
+                move.tca_move_state = 'not_sent'
+                move.tca_submission_error = False
+        return result
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # PRE-POSTING VALIDATION — block posting for UAE data errors
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _tca_validate_mandatory_fields(self):
+        """
+        Standalone mandatory field validation for PINT AE.
+        Returns a list of error message strings. Empty list = all OK.
+        Does NOT depend on the XML builder pipeline — reads invoice fields directly.
+        """
+        self.ensure_one()
+        errors = []
+        invoice = self
+        supplier = invoice.company_id.partner_id.commercial_partner_id
+        customer = invoice.partner_id.commercial_partner_id
+
+        # ── Document level ───────────────────────────────────────────────────
+        if not invoice.tca_invoice_type_code:
+            errors.append(
+                '"Invoice Type Code" is required. '
+                'Select the invoice type (e.g. 380) in the "Invoice & Buyer" section on the invoice form.'
+            )
+
+        if not invoice.invoice_date:
+            errors.append('"Invoice Date" is required.')
+
+        if not invoice.currency_id:
+            errors.append('"Currency" is required.')
+
+        type_code = invoice.tca_invoice_type_code or ''
+        is_credit_note = type_code in ('381', '381_sb', '81')
+
+        # IBT-009: Payment Due Date — mandatory for ALL invoice types incl. credit notes
+        if not invoice.invoice_date_due and not invoice.invoice_payment_term_id:
+            errors.append('"Due Date" or "Payment Terms" is required.')
+
+        # ── IBT-010: Buyer Reference ─────────────────────────────────────────
+        # Optional per PINT AE BIS — no schematron rule enforces it.
+        # The field remains on the form for buyer-PO traceability but is not
+        # required for Confirm or for valid PINT AE XML.
+
+        # ── Buyer Participant ID ─────────────────────────────────────────────
+        if not invoice.tca_buyer_participant_id:
+            errors.append(
+                '"Buyer Participant ID" is required. '
+                'Enter the buyer\'s Peppol Participant ID in the "Invoice & Buyer" section.'
+            )
+
+        # ── Transaction type flags ───────────────────────────────────────────
+        flags = (invoice.tca_transaction_type_flags or '').strip()
+        if not flags:
+            errors.append(
+                '"Transaction Type Flags" is required. '
+                'Set it to "00000000" for standard invoices in the "Transaction Type" section.'
+            )
+        elif len(flags) != 8 or not all(c in '01' for c in flags):
+            errors.append(
+                f'"Transaction Type Flags" must be exactly 8 digits of 0 or 1. Current: "{flags}".'
+            )
+
+        # ── Credit note reason ───────────────────────────────────────────────
+        if is_credit_note and not invoice.tca_credit_note_reason:
+            errors.append(
+                '"Credit Note Reason" is required for credit notes. '
+                'Set it in the "Invoice & Buyer" section.'
+            )
+
+        # ── Disclosed agent → Principal TRN ──────────────────────────────────
+        if len(flags) == 8 and flags[5] == '1' and not invoice.tca_principal_id:
+            errors.append(
+                'Disclosed Agent flag is set — "Principal TRN" is required. '
+                'Set it in the "Transaction Type" section.'
+            )
+
+        # ── Summary / Continuous → Invoice Period ────────────────────────────
+        if len(flags) == 8 and flags[3] == '1':
+            if not getattr(invoice, 'tca_invoice_period_start', None) or not getattr(invoice, 'tca_invoice_period_end', None):
+                errors.append(
+                    'Summary Invoice flag is set — "Invoice Period Start" and "End" dates are required.'
+                )
+        if len(flags) == 8 and flags[4] == '1':
+            if not getattr(invoice, 'tca_invoice_period_start', None) or not getattr(invoice, 'tca_invoice_period_end', None):
+                errors.append(
+                    'Continuous Supply flag is set — "Invoice Period Start" and "End" dates are required.'
+                )
+            if not invoice.tca_contract_reference:
+                errors.append(
+                    'Continuous Supply flag is set — "Contract Reference" is required.'
+                )
+
+        # ── Seller (company) mandatory fields ────────────────────────────────
+        if not supplier.name:
+            errors.append('Your company name (IBT-027) is missing. Set it in Settings → Companies.')
+
+        if not supplier.vat and getattr(supplier, 'peppol_eas', '') == '0235':
+            errors.append('Your company\'s "Tax ID" (TRN, IBT-031) is missing. Set it in Settings → Companies.')
+
+        if not supplier.street:
+            errors.append('Your company\'s "Street" (IBT-035) address is missing.')
+
+        if not supplier.city:
+            errors.append('Your company\'s "City" (IBT-037) is missing.')
+
+        if not supplier.country_id:
+            errors.append('Your company\'s "Country" (IBT-040) is missing.')
+
+        if supplier.country_id and supplier.country_id.code == 'AE':
+            emirate = getattr(supplier, 'tca_emirate', '') or (supplier.state_id and supplier.state_id.code) or ''
+            if emirate not in ('AUH', 'DXB', 'SHJ', 'UAQ', 'FUJ', 'AJM', 'RAK'):
+                errors.append(
+                    'Your company\'s "Emirate" must be set to one of: '
+                    'AUH, DXB, SHJ, UAQ, FUJ, AJM, RAK.'
+                )
+
+        if not getattr(supplier, 'peppol_eas', None) or not getattr(supplier, 'peppol_endpoint', None):
+            errors.append('Your company\'s "Peppol EAS" and "Peppol Endpoint" (IBT-034) are missing.')
+
+        # ibr-134-ae: Seller TRN (IBT-031) required, except for OOS / certain CN types
+        type_code = invoice.tca_invoice_type_code or ''
+        is_oos = type_code in ('480', '81')
+        if not is_oos and not supplier.vat:
+            errors.append(
+                '[ibr-134-ae] Your company\'s "Tax ID" (TRN, IBT-031) is required. '
+                'Set it in Settings → Companies. (Required unless invoice type is Out-of-Scope.)'
+            )
+
+        # IBT-030: Seller legal registration ID
+        seller_legal_reg = (
+            getattr(supplier, 'tca_trade_license', None)
+            or supplier.company_registry
+            or supplier.vat
+        )
+        if not seller_legal_reg:
+            errors.append(
+                'Your company\'s "Trade License / Registration ID" (IBT-030) is missing. '
+                'Set it on the company partner record → "E-Invoicing" tab.'
+            )
+
+        # ibr-181-ae: BTAE-15 Seller Legal ID Type required when EAS=0235 + legal reg ID provided
+        if (
+            getattr(supplier, 'peppol_eas', '') == '0235'
+            and seller_legal_reg
+            and not getattr(supplier, 'tca_legal_id_type', None)
+        ):
+            errors.append(
+                '[ibr-181-ae] Your company\'s "Legal ID Type" (BTAE-15) is required. '
+                'Set it to TL / EID / PAS / CD on the company partner record → "E-Invoicing" tab.'
+            )
+
+        # Seller authority required when type=TL
+        if getattr(supplier, 'tca_legal_id_type', '') == 'TL' and not getattr(supplier, 'tca_legal_authority', None):
+            errors.append(
+                'Your company\'s "Issuing Authority" (BTAE-12) is required when Legal ID Type is Trade License. '
+                'Set it on the company partner record → "E-Invoicing" tab.'
+            )
+
+        # Seller passport country required when type=PAS
+        if getattr(supplier, 'tca_legal_id_type', '') == 'PAS' and not getattr(supplier, 'tca_passport_country_id', None):
+            errors.append(
+                'Your company\'s "Passport Issuing Country" (BTAE-18) is required when Legal ID Type is Passport. '
+                'Set it on the company partner record → "E-Invoicing" tab.'
+            )
+
+        # ibr-141-ae: Tax point date must be strictly before invoice date
+        if invoice.tca_tax_point_date and invoice.invoice_date:
+            if invoice.tca_tax_point_date >= invoice.invoice_date:
+                errors.append(
+                    '[ibr-141-ae] "Tax Point Date" (IBT-007) must be strictly before "Invoice Date" (IBT-002). '
+                    f'Tax point: {invoice.tca_tax_point_date}, Invoice date: {invoice.invoice_date}.'
+                )
+
+        # ── Buyer mandatory fields ───────────────────────────────────────────
+        # Match official schematron scope: UAE-specific buyer checks fire only when
+        # buyer is a UAE party AND buyer participant ID is not the placeholder
+        # the buyer participant ID is one of the PINT AE predefined endpoints
+        # (9900000097/98/99) or the legacy 1XXXXXXXXX placeholder.
+        # Foreign-buyer (export) flow: minimal checks only.
+
+        if not customer.name:
+            errors.append('Customer name (IBT-044) is missing.')
+
+        if not customer.country_id:
+            errors.append(f'Customer "{customer.name}" is missing a "Country" (IBT-055).')
+
+        # IBT-049: Buyer Peppol electronic address — always required for Peppol routing
+        if not getattr(customer, 'peppol_eas', None) or not getattr(customer, 'peppol_endpoint', None):
+            errors.append(
+                f'Customer "{customer.name}" is missing "Peppol EAS" and/or "Peppol Endpoint" (IBT-049). '
+                'Open the customer record → "Accounting" tab.'
+            )
+
+        # ── Branch: UAE buyer vs foreign buyer ────────────────────────────────
+        buyer_is_uae = customer.country_id and customer.country_id.code == 'AE'
+        buyer_pid = (invoice.tca_buyer_participant_id or '').strip()
+        buyer_is_anonymous = buyer_pid in self._ANON_BUYER_PIDS
+
+        if buyer_is_uae and not buyer_is_anonymous:
+            # Strict UAE buyer checks — match ibr-149-ae, ibr-128-ae, ibr-143-ae
+
+            # IBT-048: Buyer VAT identifier (TRN)
+            if not customer.vat and getattr(customer, 'peppol_eas', '') == '0235':
+                errors.append(
+                    f'Customer "{customer.name}" is missing "Tax ID" (TRN, IBT-048). '
+                    'Set it on the customer record.'
+                )
+
+            # IBT-050: Buyer street (ibr-143/144-ae for AE party)
+            if not customer.street:
+                errors.append(f'Customer "{customer.name}" is missing "Street" (IBT-050).')
+
+            # IBT-052: Buyer city
+            if not customer.city:
+                errors.append(f'Customer "{customer.name}" is missing "City" (IBT-052).')
+
+            # ibr-128-ae: Buyer Emirate when country=AE
+            if invoice.tca_buyer_emirate not in _UAE_EMIRATES:
+                errors.append(
+                    '"Buyer Emirate" is required for UAE customers. '
+                    'Set it in the "Invoice & Buyer" section '
+                    '(AUH/DXB/SHJ/UAQ/FUJ/AJM/RAK), or set it once on the customer record.'
+                )
+
+            # ibr-149-ae: Buyer legal reg ID (IBT-047) when EAS=0235 + endpoint != placeholder
+            if not invoice.tca_buyer_trade_license:
+                errors.append(
+                    '"Buyer Trade License / Reg. ID" (IBT-047) is required. '
+                    'Set it in the "Buyer Legal" section, '
+                    'or set it once on the customer record.'
+                )
+
+            # BTAE-16: Buyer legal ID type
+            if not invoice.tca_buyer_legal_id_type:
+                errors.append(
+                    '"Buyer Legal ID Type" (BTAE-16) is required. '
+                    'Set it to TL / EID / PAS / CD in the "Buyer Legal" section.'
+                )
+
+            # ibr-101-ae: Buyer authority required when type=TL
+            if invoice.tca_buyer_legal_id_type == 'TL' and not invoice.tca_buyer_legal_authority:
+                errors.append(
+                    '"Buyer Issuing Authority" (BTAE-11) is required when Legal ID Type is Trade License. '
+                    'Set it in the "Buyer Legal" section.'
+                )
+
+            # ibr-010-ae: Buyer passport country required when type=PAS
+            if invoice.tca_buyer_legal_id_type == 'PAS' and not invoice.tca_buyer_passport_country_id:
+                errors.append(
+                    '"Buyer Passport Country" (BTAE-19) is required when Legal ID Type is Passport. '
+                    'Set it in the "Buyer Legal" section.'
+                )
+        # else: foreign / anonymous buyer — UAE-specific buyer checks skip.
+        # Schematron rules ibr-149-ae and friends won't fire either, so XML still passes.
+
+        # ── Invoice lines ────────────────────────────────────────────────────
+        product_lines = invoice.invoice_line_ids.filtered(lambda l: l.display_type == 'product')
+        if not product_lines:
+            errors.append('The invoice has no lines. Add at least one product or service line.')
+
+        for line in product_lines:
+            label = line.name or (line.product_id and line.product_id.name) or f'Line {line.sequence}'
+
+            # IBT-129: Invoiced quantity
+            if not line.quantity:
+                errors.append(f'Line "{label}": "Quantity" (IBT-129) is required and cannot be zero.')
+                break
+
+            # IBT-130: Unit of measure
+            if not line.product_uom_id:
+                errors.append(f'Line "{label}": "Unit of Measure" (IBT-130) is required.')
+                break
+
+            # IBT-153: Item name
+            if not line.name and not (line.product_id and line.product_id.name):
+                errors.append(f'Line {line.sequence}: "Description" or product name (IBT-153) is required.')
+                break
+
+            if not line.tax_ids:
+                errors.append(f'Line "{label}": at least one Tax must be applied.')
+                break
+
+            ct = line.tca_effective_commodity_type
+            if ct == 'G' and not line.tca_hs_code:
+                errors.append(f'Line "{label}": Item type is Goods — "HS Code" is mandatory.')
+                break
+            if ct == 'S' and not getattr(line, 'tca_service_accounting_code', None):
+                errors.append(f'Line "{label}": Item type is Services — "Service Accounting Code" is mandatory.')
+                break
+            if ct == 'B' and (not line.tca_hs_code or not getattr(line, 'tca_service_accounting_code', None)):
+                errors.append(f'Line "{label}": Item type is Both — both "HS Code" and "Service Accounting Code" are mandatory.')
+                break
+
+            # Reverse charge lines need RC description
+            has_rc = any(getattr(t, 'tca_tax_category', '') == 'AE' for t in line.tax_ids)
+            if has_rc and not line.tca_rc_description:
+                errors.append(f'Line "{label}": Reverse Charge tax — "Goods/Services Type" is mandatory.')
+                break
+
+        return errors
+
+    def _tca_validate_xml_pipeline(self):
+        """
+        Runs the FULL PINT AE validation pipeline against the rendered XML.
+        Returns a list of error messages (empty = all OK).
+
+        Two tiers — same checks the Send & Print wizard does:
+          Tier 1: builder._export_invoice_constraints — vals-based PINT AE rules
+                  (replicates ~30 schematron rules in Python; no XML render needed)
+          Tier 2: saxonche schematron — runs official PINT AE XSLT against
+                  rendered XML. Skipped gracefully when saxonche not installed.
+        """
+        self.ensure_one()
+        errors = []
+        builder = self.env['account.edi.xml.ubl_pint_ae']
+
+        # ── Tier 1: vals-based PINT AE constraints ──────────────────────────
+        try:
+            vals = builder._export_invoice_vals(self)
+            constraints = builder._export_invoice_constraints(self, vals)
+            # Parent returns {key: None} for passed checks — filter None values
+            for v in constraints.values():
+                if v:
+                    errors.append(v)
+        except Exception as exc:
+            _logger.exception('TCA: failed to build PINT AE vals for validation')
+            errors.append(_('Internal error building PINT AE vals: %s', exc))
+            return errors
+
+        # ── Tier 2: schematron on rendered XML ──────────────────────────────
+        sch = self.env['tca.schematron.validator']
+        if sch.is_available():
+            try:
+                xml_content, build_errors = builder._export_invoice(self)
+                if build_errors:
+                    for be in (build_errors if isinstance(build_errors, (list, set, tuple)) else [build_errors]):
+                        if be:
+                            errors.append(str(be))
+                if xml_content:
+                    xml_bytes = xml_content if isinstance(xml_content, bytes) else xml_content.encode()
+                    is_cn = self.move_type in ('out_refund', 'in_refund')
+                    result = sch.validate_xml(xml_bytes, is_credit_note=is_cn)
+                    if not result.get('skipped') and not result.get('valid'):
+                        for fatal in result.get('fatal_errors', []):
+                            msg = fatal.get('message') or fatal.get('rule_id') or 'Schematron error'
+                            errors.append(msg.strip())
+            except Exception as exc:
+                _logger.exception('TCA: schematron validation crashed at post')
+                errors.append(_('Schematron validation crashed: %s', exc))
+
+        return errors
+
+    def _tca_build_submission_id(self):
+        """
+        Build a unique invoice_number for a TCA submission attempt.
+
+        UAE FTA compliance rule: the same invoice ID cannot be processed by
+        the Peppol network more than once. Every API call to TCA must carry
+        a distinct identifier. Composing it as `<record name>-<uuid8>` makes
+        each attempt guaranteed-unique without relying on a counter that
+        could roll back on transaction failure.
+
+        Retry policy: this method is only ever called from contexts gated by
+        _tca_is_send_eligible(), which restricts to tca_move_state in
+        ('not_sent', 'error', 'rejected'). Once TCA has accepted the
+        document (state moves past 'submitted'), retries are blocked
+        upstream — so we never re-submit a record TCA has already processed.
+        """
+        self.ensure_one()
+        return f'{self.name}-{uuid.uuid4().hex[:8]}'
+
+    def _tca_submit_outbound(self):
+        """
+        Submit this posted invoice/credit note to TCA Peppol. Atomic: raises
+        UserError on any failure so the caller can rollback super()._post().
+
+        Used by `_post()` to chain credit-note submission with Confirm —
+        UAE FTA compliance requires the document to reach the Peppol network
+        before being recorded in the books.
+
+        Generates XML directly from the PINT AE builder (no PDF — the Send &
+        Print wizard remains the path for PDF-attached submission of regular
+        invoices).
+        """
+        self.ensure_one()
+        api_svc = self.env['tca.api.service']
+        company = self.company_id
+
+        # 1. Generate XML from the PINT AE builder
+        builder = self.env['account.edi.xml.ubl_pint_ae']
+        xml_content, build_errors = builder._export_invoice(self)
+        if build_errors:
+            errs = build_errors if isinstance(build_errors, (list, set, tuple)) else [build_errors]
+            raise UserError(_(
+                'TCA: cannot build PINT AE XML:\n%s', '\n'.join(str(e) for e in errs)
+            ))
+        if not xml_content:
+            raise UserError(_('TCA: PINT AE XML builder returned empty content.'))
+        xml_bytes = xml_content if isinstance(xml_content, bytes) else xml_content.encode()
+        xml_filename = (self.name or 'document').replace('/', '_') + '.xml'
+
+        # 2. Build a unique submission ID for THIS attempt (UAE compliance).
+        submission_id = self._tca_build_submission_id()
+
+        # 3. Get presigned upload URL from TCA
+        self.tca_move_state = 'uploading'
+        upload_response = api_svc.get_document_upload_url(company, filename=xml_filename)
+        upload_url = upload_response.get('upload_url')
+        source_file_path = (
+            upload_response.get('path')
+            or upload_response.get('s3_uri')
+            or upload_response.get('s3_path')
+            or upload_response.get('file_key')
+        )
+        if not upload_url or not source_file_path:
+            raise UserError(_(
+                'TCA did not return a valid upload URL. Response: %s', upload_response
+            ))
+
+        # 4. Upload XML bytes to S3 (presigned)
+        api_svc.upload_to_s3(upload_url, xml_bytes)
+
+        # 5. Register invoice with TCA using the unique submission_id
+        result = api_svc.submit_invoice(
+            company=company,
+            name=submission_id,
+            invoice_number=submission_id,
+            source_file_path=source_file_path,
+        )
+
+        # 6. 409/400-already-exists treated as success (defensive: should not
+        # happen given our unique submission_id, but catches state-desync edge
+        # cases where TCA accepted a prior call we lost track of).
+        if result.get('tca_duplicate'):
+            self.write({
+                'tca_move_state': 'submitted',
+                'tca_submission_error': False,
+                'tca_last_submission_id': submission_id,
+            })
+            self._message_log(body=_(
+                'TCA: document already registered (duplicate detected on submission "%s"). '
+                'Status will sync via cron.', submission_id,
+            ))
+            return True
+
+        # 7. Success — store the TCA id, submission id used, and mark submitted
+        tca_id = result.get('id', '')
+        self.write({
+            'tca_invoice_uuid': tca_id,
+            'tca_move_state': 'submitted',
+            'tca_submission_error': False,
+            'tca_last_submission_id': submission_id,
+        })
+        self._message_log(body=_(
+            'Submitted to TCA Peppol network on Confirm. '
+            'TCA invoice_number: %(sid)s — TCA ID: %(tid)s',
+            sid=submission_id, tid=tca_id,
+        ))
+        return True
+
+    def _post(self, soft=True):
+        """
+        EXTENDS account.move.
+        Three-phase PINT AE flow at Confirm:
+          Phase 1 (pre-post): _tca_validate_mandatory_fields — fast Python checks
+                              on partner / invoice fields. Fails → no ledger entry.
+          Phase 2 (post-post): _tca_validate_xml_pipeline — full XML constraints +
+                              saxonche schematron, same as Send & Print wizard.
+                              Fails → UserError rolls back the super()._post().
+          Phase 3 (credit notes only): _tca_submit_outbound — register the document
+                              with TCA Peppol synchronously. UAE FTA compliance:
+                              no credit note in the books until it reaches Peppol.
+                              Fails → UserError rolls back the super()._post().
+
+        Net guarantee: a credit note is either in the books AND on the Peppol
+        network, or in neither — never half-committed.
+
+        Scope: sale documents on TCA-active company whose buyer uses ubl_pint_ae.
+
+        Known limitation — sequence gaps on failure:
+          super()._post() assigns the document name from the journal's sequence
+          via PostgreSQL's nextval(), which is NOT transactional — the sequence
+          advance survives a rollback. When Phase 2 or Phase 3 raises UserError,
+          the move is rolled back to draft but the consumed sequence number is
+          gone. The next successful Confirm picks up the FOLLOWING number,
+          leaving a permanent gap.
+
+          UAE FTA expects sequential invoice numbering. In practice, gaps are
+          rare (only on actual TCA failures, which should be uncommon in
+          production) and can be explained in audits. Proper no-gap behavior
+          would require replacing the journal sequence with a row-locked
+          counter table that's truly transactional — out of scope for this
+          revision. TODO: implement a custom counter for TCA-active journals.
+        """
+        # ── Phase 1: pre-post fast checks ─────────────────────────────────────
+        pint_moves = self.env['account.move']
+        for move in self:
+            partner = move.partner_id.commercial_partner_id
+            if (
+                move.company_id.tca_is_active
+                and move.is_sale_document()
+                and partner.ubl_cii_format == 'ubl_pint_ae'
+            ):
+                errors = move._tca_validate_mandatory_fields()
+                if errors:
+                    raise UserError(_(
+                        'Cannot confirm this invoice — the following issues must be fixed first:\n\n%s',
+                        '\n'.join(f'• {v}' for v in errors)
+                    ))
+                pint_moves |= move
+
+        # ── Standard Odoo posting (assigns sequence + ledger entries) ────────
+        result = super()._post(soft=soft)
+
+        # ── Phase 2: full XML validation on the just-posted invoice ──────────
+        # Raising here rolls back super()._post() — invoice returns to draft,
+        # no ledger entries persist.
+        for move in pint_moves:
+            xml_errors = move._tca_validate_xml_pipeline()
+            if xml_errors:
+                raise UserError(_(
+                    'Cannot confirm this invoice — PINT AE validation failed:\n\n%s\n\n'
+                    'Fix these issues, then try Confirm again.',
+                    '\n'.join(f'• {v}' for v in xml_errors)
+                ))
+
+        # ── Phase 3: TCA submission for credit notes (atomic with post) ───────
+        # UAE FTA requires that a credit note must reach the Peppol network
+        # before it can be considered "in the books". On any failure (validation,
+        # network, TCA rejection) we raise UserError, rolling back super()._post()
+        # so the credit note stays in draft.
+        #
+        # Batch safety: if multiple credit notes are posted at once and TCA
+        # accepts some but rejects a later one, the accepted ones are already
+        # on Peppol (HTTP done) but the raise below rolls back the local DB
+        # state for ALL of them — creating drift between Odoo and TCA that we
+        # cannot reconcile (TCA documents cannot be un-submitted). To prevent
+        # this we restrict atomic credit-note posting to a single record per
+        # call. Multi-confirm of credit notes must be done one at a time.
+        credit_notes = pint_moves.filtered(
+            lambda m: m.move_type == 'out_refund'
+            and m.tca_move_state in ('not_sent', 'error', 'rejected')
+        )
+        if len(credit_notes) > 1:
+            raise UserError(_(
+                'Confirm credit notes one at a time. TCA Peppol submission '
+                'happens during Confirm and cannot be safely batched: if TCA '
+                'accepts the first credit note and rejects the second, the '
+                'first would already be on the Peppol network while local '
+                'records are rolled back, leaving Odoo and TCA out of sync.\n\n'
+                'Please select a single credit note and Confirm it, then move '
+                'on to the next.'
+            ))
+        if credit_notes:
+            move = credit_notes  # exactly one record at this point
+            try:
+                move._tca_submit_outbound()
+            except UserError:
+                raise  # propagate already-clear error
+            except Exception as exc:
+                _logger.exception('TCA: credit-note submission crashed during _post')
+                raise UserError(_(
+                    'Cannot confirm credit note %(name)s — TCA submission failed.\n\n%(err)s\n\n'
+                    'Per UAE FTA regulations, a credit note must be sent to the '
+                    'Peppol network before it is recorded in the books. Fix the '
+                    'issue and try Confirm again.',
+                    name=move.name or '(draft)', err=exc,
+                )) from exc
+
+        return result
 
     # ──────────────────────────────────────────────────────────────────────────
     # INBOUND XML ROUTING — register PINT AE in the builder dispatch table
@@ -282,7 +1729,7 @@ class AccountMove(models.Model):
         # Determine new state from most → least granular signal
         # c5 Accepted = buyer has confirmed receipt (terminal success)
         if c5_status == TCA_C5_ACCEPTED:
-            new_state = 'received'
+            new_state = 'buyer_confirmed'
         # status=Completed + c3 Accepted = delivered to buyer AP
         elif tca_status == TCA_STATUS_COMPLETED and c3_status == TCA_C3_ACCEPTED:
             new_state = 'delivered'
@@ -388,10 +1835,27 @@ class AccountMove(models.Model):
             payload = api_svc.get_invoice_status(company, invoice.tca_invoice_uuid)
             invoice._tca_update_state_from_payload(payload)
         except Exception as exc:
-            _logger.error(
-                'TCA cron: failed to poll status for invoice %s (uuid=%s): %s',
-                invoice.name, invoice.tca_invoice_uuid, exc
-            )
+            exc_str = str(exc).lower()
+            is_transient = any(t in exc_str for t in ('timeout', '503', 'cannot reach', 'urlopen', 'connection'))
+            if is_transient:
+                # Transient — leave state unchanged, cron will retry next run
+                _logger.warning(
+                    'TCA cron: transient error polling invoice %s (uuid=%s), will retry: %s',
+                    invoice.name, invoice.tca_invoice_uuid, exc
+                )
+            else:
+                # Permanent — mark as error so user investigates
+                _logger.error(
+                    'TCA cron: permanent error polling invoice %s (uuid=%s): %s',
+                    invoice.name, invoice.tca_invoice_uuid, exc
+                )
+                invoice.write({
+                    'tca_move_state': 'error',
+                    'tca_submission_error': str(exc),
+                })
+                invoice._message_log(body=_(
+                    'TCA cron: status poll failed — %s', exc
+                ))
 
     @api.model
     def _cron_tca_pull_inbound_invoices(self):
@@ -450,14 +1914,14 @@ class AccountMove(models.Model):
         while True:
             for tca_invoice in page_invoices:
                 tca_id = tca_invoice.get('id')
-                xml_location_path = tca_invoice.get('invoice_xml_location_path')
+                xml_location_path = tca_invoice.get('document_location_path') or tca_invoice.get('invoice_xml_location_path')
                 created_at = str(tca_invoice.get('created_at') or '')
 
                 if not tca_id:
                     continue
 
                 # G-6: skip if older than cursor (already imported in a prior run)
-                if last_sync and created_at and created_at <= last_sync:
+                if last_sync and created_at and created_at < last_sync:
                     continue
 
                 # Deduplication — belt-and-suspenders after cursor check
@@ -469,17 +1933,36 @@ class AccountMove(models.Model):
                     continue
 
                 if not xml_location_path:
-                    _logger.warning(
-                        'TCA cron: inbound invoice id=%s has no invoice_xml_location_path, skipping',
-                        tca_id
-                    )
-                    continue
+                    # List endpoint omits xml path — fetch detail (same as webhook).
+                    # Backend returns it on single GET via `invoice_xml_location_path`.
+                    try:
+                        detail = api_svc.get_invoice_status(company, tca_id)
+                        xml_location_path = (
+                            detail.get('document_location_path')
+                            or detail.get('invoice_xml_location_path')
+                        )
+                    except Exception as exc:
+                        _logger.warning(
+                            'TCA cron: failed to fetch detail for inbound id=%s: %s',
+                            tca_id, exc
+                        )
+                        continue
+                    if not xml_location_path:
+                        _logger.warning(
+                            'TCA cron: inbound invoice id=%s has no XML path even after detail fetch, skipping',
+                            tca_id
+                        )
+                        continue
 
-                # G-2: commit between imports — isolate failures
+                # G-2: commit between imports — isolate failures.
+                # After commit, the ORM cache must be invalidated: records held
+                # in-memory may be stale relative to other concurrent transactions
+                # that ran while we were doing HTTP work for this iteration.
                 move = self._tca_import_inbound_invoice(
                     company, tca_id, xml_location_path, api_svc
                 )
                 self.env.cr.commit()  # noqa: B012 — intentional mid-cron commit
+                self.env.invalidate_all()
 
                 if move:
                     if created_at > latest_created_at:
@@ -525,6 +2008,13 @@ class AccountMove(models.Model):
                 'TCA: failed to download XML for id %s (path=%s): %s',
                 tca_id, xml_location_path, exc
             )
+            # No stub created — cron will retry on next run (cursor doesn't advance).
+            # Log to company partner chatter so admins are aware.
+            company.partner_id._message_log(body=_(
+                'TCA Peppol: failed to download inbound invoice XML (ID: %s). '
+                'Error: %s. Will retry on next cron run.',
+                tca_id, exc,
+            ))
             return None
 
         # Find a purchase journal for this company
@@ -538,20 +2028,28 @@ class AccountMove(models.Model):
 
         # Create attachment
         filename = f'tca_inbound_{tca_id}.xml'
-        attachment = self.env['ir.attachment'].create({
-            'name': filename,
-            'datas': xml_bytes,
-            'res_model': 'account.journal',
-            'res_id': journal.id,
-            'type': 'binary',
-            'mimetype': 'application/xml',
-        })
+        from base64 import b64encode
+        try:
+            attachment = self.env['ir.attachment'].create({
+                'name': filename,
+                'datas': b64encode(xml_bytes),
+                'res_model': 'account.journal',
+                'res_id': journal.id,
+                'type': 'binary',
+                'mimetype': 'application/xml',
+            })
+        except Exception as exc:
+            _logger.error('TCA: attachment creation failed for id %s: %s', tca_id, exc)
+            return None
 
         # Use Odoo's standard UBL import pipeline.
         # _create_document_from_attachment routes via _get_ubl_cii_builder_from_xml_tree
         # which correctly routes PINT AE CustomizationID to our builder.
         try:
-            move = journal._create_document_from_attachment(attachment.id)
+            move = journal.with_context(
+                default_move_type='in_invoice',
+                default_journal_id=journal.id,
+            )._create_document_from_attachment(attachment.id)
         except Exception as exc:
             _logger.error('TCA: UBL import failed for id %s: %s', tca_id, exc)
             # G-3: create a bare draft vendor bill stub so the document is not lost.
@@ -561,7 +2059,7 @@ class AccountMove(models.Model):
                 'journal_id': journal.id,
                 'company_id': company.id,
                 'tca_invoice_uuid': tca_id,
-                'tca_move_state': 'received',
+                'tca_move_state': 'inbound_received',
                 'tca_is_inbound': True,
                 'tca_inbound_status': 'pending',
                 'ref': f'TCA-{tca_id}',
@@ -582,13 +2080,30 @@ class AccountMove(models.Model):
         if move:
             move.sudo().write({
                 'tca_invoice_uuid': tca_id,
-                'tca_move_state': 'received',
+                'tca_move_state': 'inbound_received',
                 'tca_is_inbound': True,
                 'tca_inbound_status': 'pending',
             })
             move._message_log(
                 body=_('Invoice imported from TCA Peppol network (ID: %s).', tca_id)
             )
+        else:
+            _logger.warning('TCA: _create_document_from_attachment returned empty for id %s', tca_id)
+            move = self.env['account.move'].create({
+                'move_type': 'in_invoice',
+                'journal_id': journal.id,
+                'company_id': company.id,
+                'tca_invoice_uuid': tca_id,
+                'tca_move_state': 'inbound_received',
+                'tca_is_inbound': True,
+                'tca_inbound_status': 'pending',
+                'ref': f'TCA-{tca_id}',
+            })
+            attachment.write({'res_model': 'account.move', 'res_id': move.id})
+            move._message_log(body=_(
+                'TCA Peppol: import returned empty for inbound invoice (ID: %s). '
+                'The raw XML is attached. Please fill in the details manually.', tca_id
+            ))
 
         return move
 
@@ -598,9 +2113,10 @@ class AccountMove(models.Model):
 
     def action_tca_resend(self):
         """
-        Opens the Send & Print wizard pre-configured for TCA resend.
-        Available on invoices in 'error' or 'rejected' state.
-        Resets the state to 'not_sent' so the wizard's compute allows re-submission.
+        Resend a failed/rejected invoice to TCA.
+        If tca_invoice_uuid exists, uses PUT /resubmit/ endpoint (re-uploads XML
+        and retries the existing TCA record). Otherwise opens the Send & Print
+        wizard for a full 3-step submission.
         """
         self.ensure_one()
         if self.tca_move_state not in ('error', 'rejected'):
@@ -608,10 +2124,17 @@ class AccountMove(models.Model):
                 'Invoice %s cannot be resent — current TCA state is "%s".',
                 self.name, self.tca_move_state
             ))
-        # Reset state so the wizard compute detects it as eligible
-        self.tca_move_state = 'not_sent'
-        self.tca_submission_error = False
 
+        # If we have a TCA ID, use the resubmit endpoint (avoids duplicate 409)
+        if self.tca_invoice_uuid:
+            return self._tca_resubmit_existing()
+
+        # No TCA ID — go through full wizard flow.
+        # Do NOT pre-mutate tca_move_state / tca_submission_error here: if the
+        # user opens the wizard and then cancels, the previous error context
+        # should remain visible. The wizard's submission code clears these
+        # fields on success (and the Send-eligible / enable_tca checks both
+        # accept 'error' and 'rejected' states, so no reset is needed).
         return {
             'name': _('Send & Print'),
             'type': 'ir.actions.act_window',
@@ -622,6 +2145,74 @@ class AccountMove(models.Model):
                 'active_ids': [self.id],
                 'active_model': 'account.move',
                 'default_move_ids': [self.id],
+            },
+        }
+
+    def _tca_resubmit_existing(self):
+        """
+        Resubmit an invoice that already has a tca_invoice_uuid.
+        Uses PUT /api/v1/invoices/{id}/resubmit/ — re-uploads XML and retries.
+        """
+        self.ensure_one()
+        api_svc = self.env['tca.api.service']
+        company = self.company_id
+
+        # Generate fresh XML
+        builder = self.partner_id.commercial_partner_id._get_edi_builder()
+        xml_content, errors = builder._export_invoice(self)
+        if errors:
+            raise UserError(_('PINT AE XML generation failed:\n%s', '\n'.join(errors)))
+        xml_bytes = xml_content if isinstance(xml_content, bytes) else xml_content.encode()
+
+        try:
+            # Upload new XML to S3
+            self.tca_move_state = 'uploading'
+            upload_response = api_svc.get_document_upload_url(company, filename=f'{self.name.replace("/", "_")}_pint_ae.xml')
+            upload_url = upload_response.get('upload_url')
+            source_file_path = (
+                upload_response.get('path')
+                or upload_response.get('s3_uri')
+                or upload_response.get('s3_path')
+                or upload_response.get('file_key')
+            )
+            if not upload_url or not source_file_path:
+                raise UserError(_('TCA did not return a valid upload URL.'))
+
+            api_svc.upload_to_s3(upload_url, xml_bytes)
+
+            # Call resubmit endpoint
+            result = api_svc.resubmit_invoice(
+                company=company,
+                tca_id=self.tca_invoice_uuid,
+                name=self.name,
+                source_file_path=source_file_path,
+            )
+
+            self.write({
+                'tca_move_state': 'submitted',
+                'tca_submission_error': False,
+            })
+            self._message_log(body=_(
+                'Invoice resubmitted to TCA via /resubmit/ endpoint. ID: %s', self.tca_invoice_uuid
+            ))
+            _logger.info('TCA: invoice %s resubmitted. ID=%s', self.name, self.tca_invoice_uuid)
+
+        except Exception as exc:
+            self.write({
+                'tca_move_state': 'error',
+                'tca_submission_error': str(exc),
+            })
+            self._message_log(body=_('TCA resubmission failed: %s', exc))
+            raise UserError(_('TCA resubmission failed: %s', exc)) from exc
+
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _('Invoice Resubmitted'),
+                'message': _('Invoice %s has been resubmitted to TCA.', self.name),
+                'type': 'success',
+                'sticky': False,
             },
         }
 
@@ -641,8 +2232,8 @@ class AccountMove(models.Model):
         if self.state != 'draft':
             raise UserError(_('Only draft invoices can be accepted. Current state: %s', self.state))
 
-        self.tca_inbound_status = 'accepted'
         self.action_post()
+        self.tca_inbound_status = 'accepted'
         self._message_log(body=_('Inbound invoice accepted and posted to ledger.'))
 
         # TODO: When TCA adds an Invoice Response endpoint, send AP (Accepted)

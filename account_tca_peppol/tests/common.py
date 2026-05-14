@@ -44,6 +44,8 @@ class TcaTestCase(TransactionCase):
         # Add UAE company fields expected by PINT AE (emirate, TRN, Peppol EAS)
         cls.company.partner_id.write({
             'country_id': cls.uae.id,
+            'street': 'Sheikh Zayed Road',
+            'city': 'Dubai',
             'peppol_eas': '0235',
             'peppol_endpoint': '100230400900003',
             'tca_emirate': 'DXB',
@@ -64,6 +66,8 @@ class TcaTestCase(TransactionCase):
             'name': 'UAE Buyer Co.',
             'is_company': True,
             'country_id': cls.uae.id,
+            'street': 'Corniche Road',
+            'city': 'Abu Dhabi',
             'vat': '200000000000003',
             'peppol_eas': '0235',
             'peppol_endpoint': '200000000000003',
@@ -146,6 +150,7 @@ class TcaTestCase(TransactionCase):
             'partner_id': (partner or self.partner).id,
             'company_id': self.company.id,
             'journal_id': self.journal.id,
+            'tca_buyer_reference': 'PO-TEST-001',
             'invoice_line_ids': [(0, 0, {
                 'name': 'Consulting Services',
                 'quantity': quantity,
@@ -155,6 +160,9 @@ class TcaTestCase(TransactionCase):
                 'tca_commodity_type': commodity_type,
             })],
         }
+        # Credit notes need reason (BTAE-03) — use VD (Volume Discount, no preceding ref needed)
+        if move_type in ('out_refund', 'in_refund'):
+            vals['tca_credit_note_reason'] = 'VD'
         if currency:
             vals['currency_id'] = currency.id
         invoice = self.env['account.move'].with_company(self.company).create(vals)

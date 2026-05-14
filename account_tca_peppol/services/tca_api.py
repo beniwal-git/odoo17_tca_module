@@ -22,7 +22,7 @@ Outbound invoice flow (3 steps):
 
 Inbound invoice flow:
   GET  /api/v1/invoices/?direction=2    list received invoices (each has invoice_xml_location_path)
-  GET  /api/v1/documents/download/?s3_path=...  → presigned download URL
+  POST /api/v1/documents/download/      { s3_uri } → presigned download URL
   GET  {presigned_url}                  → raw XML bytes
 
 Resubmission:
@@ -43,8 +43,11 @@ _logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 TOKEN_EXPIRY_BUFFER_SECONDS = 60   # refresh token 60 s before actual expiry
-HTTP_TIMEOUT = 30                   # seconds for all API calls
-S3_UPLOAD_TIMEOUT = 120             # seconds for S3 PUT (larger files)
+# Defaults — overridable per deployment via ir.config_parameter
+# (tca.http_timeout, tca.s3_upload_timeout). See _tca_http_timeout /
+# _tca_s3_upload_timeout below.
+DEFAULT_HTTP_TIMEOUT = 30           # seconds for general API calls
+DEFAULT_S3_UPLOAD_TIMEOUT = 120     # seconds for S3 PUT (larger files)
 
 
 class TcaApiService(models.AbstractModel):
@@ -56,6 +59,44 @@ class TcaApiService(models.AbstractModel):
     _description = 'TCA Peppol API Service'
 
     # ──────────────────────────────────────────────────────────────────────────
+    # CONFIG ACCESSORS — timeouts are tunable per deployment.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @api.model
+    def _tca_http_timeout(self):
+        """Seconds for general TCA REST calls. Override via
+        ir.config_parameter `tca.http_timeout`; falls back to
+        DEFAULT_HTTP_TIMEOUT (30 s)."""
+        raw = self.env['ir.config_parameter'].sudo().get_param(
+            'tca.http_timeout', DEFAULT_HTTP_TIMEOUT,
+        )
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            _logger.warning(
+                'TCA: invalid tca.http_timeout %r — using default %ss',
+                raw, DEFAULT_HTTP_TIMEOUT,
+            )
+            return DEFAULT_HTTP_TIMEOUT
+
+    @api.model
+    def _tca_s3_upload_timeout(self):
+        """Seconds for S3 presigned upload PUT requests. Override via
+        ir.config_parameter `tca.s3_upload_timeout`; falls back to
+        DEFAULT_S3_UPLOAD_TIMEOUT (120 s)."""
+        raw = self.env['ir.config_parameter'].sudo().get_param(
+            'tca.s3_upload_timeout', DEFAULT_S3_UPLOAD_TIMEOUT,
+        )
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            _logger.warning(
+                'TCA: invalid tca.s3_upload_timeout %r — using default %ss',
+                raw, DEFAULT_S3_UPLOAD_TIMEOUT,
+            )
+            return DEFAULT_S3_UPLOAD_TIMEOUT
+
+    # ──────────────────────────────────────────────────────────────────────────
     # TOKEN MANAGEMENT
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -65,6 +106,14 @@ class TcaApiService(models.AbstractModel):
         Return a valid Bearer token for the given company.
         Proactively refreshes if the access token is expiring within the buffer window.
         Falls back to fetching a completely new token pair if refresh fails.
+
+        Concurrency: uses pg_advisory_xact_lock (Postgres advisory lock scoped
+        to the current transaction) to serialize concurrent refreshes on the
+        same company. The lock is auto-released at transaction commit/rollback
+        — no manual cleanup, no savepoint-scoping pitfalls. After acquiring
+        the lock, we re-read the token: a peer that held the lock just before
+        us may have already done the refresh, in which case we return the
+        fresh token without making a redundant HTTP call.
         """
         now = int(time.time())
         expires_at = int(company._get_tca_param('access_token_expires_at', '0'))
@@ -72,6 +121,24 @@ class TcaApiService(models.AbstractModel):
 
         if access_token and expires_at > now + TOKEN_EXPIRY_BUFFER_SECONDS:
             return access_token  # Still valid
+
+        # Acquire a per-company advisory lock. pg_advisory_xact_lock blocks
+        # until the lock is acquired and is released automatically at the end
+        # of the transaction. The two-int signature uses a stable hash of the
+        # subsystem name plus the company id so locks across companies and
+        # across unrelated subsystems do not collide.
+        self.env.cr.execute(
+            "SELECT pg_advisory_xact_lock(hashtext('tca_token'), %s)",
+            [company.id],
+        )
+
+        # Re-check token freshness — a concurrent worker may have refreshed
+        # while we waited for the lock.
+        now = int(time.time())
+        expires_at = int(company._get_tca_param('access_token_expires_at', '0'))
+        access_token = company._get_tca_param('access_token', '')
+        if access_token and expires_at > now + TOKEN_EXPIRY_BUFFER_SECONDS:
+            return access_token
 
         refresh_token = company._get_tca_param('refresh_token', '')
         if refresh_token:
@@ -167,17 +234,19 @@ class TcaApiService(models.AbstractModel):
     # ──────────────────────────────────────────────────────────────────────────
 
     @api.model
-    def get_document_upload_url(self, company):
+    def get_document_upload_url(self, company, filename='invoice.xml'):
         """
         Step 1 of the outbound invoice flow.
         POST /api/v1/documents/
+        Body: { name: "invoice.xml", extension: "xml" }
         Returns a presigned S3 upload URL and the S3 URI to pass as source_file_path.
-
-        Expected response shape:
-          { upload_url, s3_uri, expires_in }
-        Note: exact field names pending OQ-5 confirmation against TCA sandbox.
         """
-        return self._http_post(company, '/api/v1/documents/', {})
+        name = filename or 'invoice.xml'
+        extension = name.rsplit('.', 1)[-1] if '.' in name else 'xml'
+        return self._http_post(company, '/api/v1/documents/', {
+            'name': name,
+            'extension': extension,
+        })
 
     @api.model
     def upload_to_s3(self, upload_url, xml_bytes, content_type='application/xml'):
@@ -199,7 +268,7 @@ class TcaApiService(models.AbstractModel):
         req.add_header('Content-Length', str(len(xml_bytes)))
 
         try:
-            with urlopen(req, timeout=S3_UPLOAD_TIMEOUT) as resp:
+            with urlopen(req, timeout=self._tca_s3_upload_timeout()) as resp:
                 status = resp.status
         except HTTPError as exc:
             raise UserError(_(
@@ -279,7 +348,7 @@ class TcaApiService(models.AbstractModel):
         """
         return self._http_get(
             company,
-            f'/api/v1/invoices/?direction=2&limit={limit}',
+            f'/api/v1/invoices/?direction=2&page_size={limit}',
         )
 
     @api.model
@@ -292,21 +361,20 @@ class TcaApiService(models.AbstractModel):
         """
         return self._http_get(
             company,
-            f'/api/v1/invoices/?direction=1&status=1&limit={limit}',
+            f'/api/v1/invoices/?direction=1&status=1&page_size={limit}',
         )
 
     @api.model
     def get_document_download_url(self, company, s3_path):
         """
-        GET /api/v1/documents/download/?s3_path={s3_path}
-        Returns a presigned S3 download URL for the given S3 path.
-        Used to fetch the XML of an inbound invoice via invoice_xml_location_path.
-
-        Note: exact query param name and response shape pending OQ-8 confirmation.
-        Expected response shape: { download_url: "...", expires_in: 1200 }
+        POST /api/v1/documents/download/
+        Body: { "s3_uri": "s3://bucket/path/to/file.xml" }
+        Returns a presigned S3 download URL.
+        Response: { download_url: "...", expires_in: 1200 }
         """
-        encoded_path = quote(s3_path, safe='')
-        return self._http_get(company, f'/api/v1/documents/download/?s3_path={encoded_path}')
+        return self._http_post(company, '/api/v1/documents/download/', {
+            's3_uri': s3_path,
+        })
 
     @api.model
     def download_inbound_xml(self, company, s3_path):
@@ -330,7 +398,7 @@ class TcaApiService(models.AbstractModel):
 
         req = Request(download_url, method='GET')
         try:
-            with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            with urlopen(req, timeout=self._tca_http_timeout()) as resp:
                 return resp.read()
         except HTTPError as exc:
             raise UserError(_(
@@ -426,7 +494,7 @@ class TcaApiService(models.AbstractModel):
     def _execute_request(self, req, expected_status):
         """Execute an urllib Request and return parsed JSON. Raises UserError on failure."""
         try:
-            with urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            with urlopen(req, timeout=self._tca_http_timeout()) as resp:
                 status = resp.status
                 raw = resp.read()
         except HTTPError as exc:
@@ -443,10 +511,35 @@ class TcaApiService(models.AbstractModel):
             if exc.code == 401:
                 raise UserError(_('TCA authentication failed (401). Check API credentials.')) from exc
             if exc.code == 409:
-                raise UserError(_(
-                    'TCA rejected this invoice as a duplicate (409). '
-                    'invoice_number already exists for this organisation: %s', detail
-                )) from exc
+                _logger.info('TCA: 409 duplicate — invoice already exists: %s', detail)
+                try:
+                    return {**json.loads(body), 'tca_duplicate': True}
+                except Exception:
+                    return {'tca_duplicate': True, 'detail': detail}
+            # TCA returns HTTP 400 (not 409) when invoice_number is already taken
+            # for the organization. The response shape is a DRF field-level error:
+            #   {"invoice_number": ["An invoice with this number already exists..."]}
+            # Match on the STRUCTURED shape — checking the invoice_number key has a
+            # message containing 'exists' or 'duplicate'. Robust against TCA wording
+            # changes (translations, rewording) — only triggers if TCA explicitly
+            # flags the invoice_number field as the conflicting one.
+            if exc.code == 400:
+                try:
+                    err_data = json.loads(body)
+                except Exception:
+                    err_data = None
+                if isinstance(err_data, dict):
+                    inv_num_errs = err_data.get('invoice_number')
+                    if isinstance(inv_num_errs, list) and any(
+                        isinstance(e, str)
+                        and ('exists' in e.lower() or 'duplicate' in e.lower())
+                        for e in inv_num_errs
+                    ):
+                        _logger.info(
+                            'TCA: 400 duplicate invoice_number on %s: %s',
+                            req.full_url, inv_num_errs,
+                        )
+                        return {**err_data, 'tca_duplicate': True}
             if exc.code == 422:
                 raise UserError(_('TCA validation error (422): %s', detail)) from exc
 

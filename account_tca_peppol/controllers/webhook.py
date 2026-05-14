@@ -182,7 +182,10 @@ class TcaWebhookController(http.Controller):
         # Get invoice_xml_location_path — may be in the webhook payload directly,
         # or we need to fetch it via GET /api/v1/invoices/{id}/
         invoice_data = payload.get('invoice') or payload
-        xml_location_path = invoice_data.get('invoice_xml_location_path')
+        xml_location_path = (
+            invoice_data.get('document_location_path')
+            or invoice_data.get('invoice_xml_location_path')
+        )
 
         if not xml_location_path:
             _logger.info(
@@ -192,7 +195,7 @@ class TcaWebhookController(http.Controller):
             try:
                 api_svc = request.env['tca.api.service'].sudo()
                 detail = api_svc.get_invoice_status(company, tca_id)
-                xml_location_path = detail.get('invoice_xml_location_path')
+                xml_location_path = detail.get('document_location_path') or detail.get('invoice_xml_location_path')
             except Exception as exc:
                 _logger.error(
                     'TCA webhook: failed to fetch invoice detail for id=%s: %s', tca_id, exc
@@ -273,11 +276,11 @@ class TcaWebhookController(http.Controller):
         with a warning (allows testing without a secret set).
         """
         if not webhook_secret:
-            _logger.warning(
-                'TCA webhook: no webhook_secret configured — skipping signature validation. '
+            _logger.critical(
+                'TCA webhook: no webhook_secret configured for company — REJECTING. '
                 'Set the Webhook Secret in company TCA settings for production use.'
             )
-            return True  # Pass through — useful during initial setup
+            return False
 
         if not signature_header:
             return False
