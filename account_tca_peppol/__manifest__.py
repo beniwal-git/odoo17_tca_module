@@ -25,6 +25,15 @@
         'account',
         'account_edi_ubl_cii',
     ],
+    # saxonche powers PINT AE schematron validation (services/
+    # schematron_validator.py). It is soft-imported — the module still
+    # installs without it, but schematron validation is silently skipped.
+    # Declaring it here surfaces a clear "missing dependency" error at
+    # install time instead of failing quietly. odoo.sh picks it up from
+    # the repo-root requirements.txt.
+    'external_dependencies': {
+        'python': ['saxonche'],
+    },
     # l10n_ae (UAE chart of accounts) is NOT a hard dependency — the addon works without
     # it. Installing l10n_ae is strongly recommended for UAE companies as it provides the
     # correct VAT tax groups and account structure expected by UAE e-invoicing.
