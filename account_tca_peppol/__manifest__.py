@@ -24,6 +24,14 @@
     'depends': [
         'account',
         'account_edi_ubl_cii',
+        # l10n_ae provides the UAE chart of accounts, the 5% VAT taxes
+        # and tax groups our PINT AE flows need. Hard dep because:
+        # (a) this addon is UAE-specific, (b) our test fixtures load the
+        # AE CoA via try_loading('ae') — on a fresh DB without l10n_ae
+        # that triggers button_immediate_install mid-test and Odoo
+        # forbids it ("Module operations inside tests are not
+        # transactional and thus forbidden").
+        'l10n_ae',
     ],
     # saxonche powers PINT AE schematron validation (services/
     # schematron_validator.py). It is soft-imported — the module still
@@ -34,10 +42,6 @@
     'external_dependencies': {
         'python': ['saxonche'],
     },
-    # l10n_ae (UAE chart of accounts) is NOT a hard dependency — the addon works without
-    # it. Installing l10n_ae is strongly recommended for UAE companies as it provides the
-    # correct VAT tax groups and account structure expected by UAE e-invoicing.
-    #
     # account_peppol uses the Odoo IAP proxy and conflicts with TCA's direct AP
     # integration. Both cannot be installed simultaneously.
     'conflicts': ['account_peppol'],
