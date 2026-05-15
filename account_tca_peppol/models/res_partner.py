@@ -227,13 +227,31 @@ class ResPartner(models.Model):
         Enforce UAE PINT AE mandatory fields + format rules on UAE business
         partners. Returns a single dialog listing every issue.
 
-        Scope: country = AE, is_company = True.
-        Anything else: no UAE-specific checks fire.
+        Scope: UAE company partners that the user has started configuring
+        for PINT AE — i.e. peppol_eas is '0235' OR at least one tca_* field
+        is set. Auto-created partners (e.g. the partner Odoo creates inside
+        `res.company.create`) carry none of these markers, so the check is
+        skipped and company creation isn't blocked. Once the user opens
+        the partner and fills any PINT AE field, the full set becomes
+        mandatory on the next save.
         """
         for partner in self:
             if not partner.is_company:
                 continue
             if not (partner.country_id and partner.country_id.code == 'AE'):
+                continue
+            # Skip until the user has explicitly opted into PINT AE
+            # configuration on this partner.
+            opted_in = (
+                partner.peppol_eas == '0235'
+                or partner.tca_emirate
+                or partner.tca_legal_id_type
+                or partner.tca_trade_license
+                or partner.tca_legal_authority
+                or partner.tca_passport_country_id
+                or partner.tca_legal_form
+            )
+            if not opted_in:
                 continue
 
             errors = []
