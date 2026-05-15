@@ -240,10 +240,15 @@ class ResPartner(models.Model):
                 continue
             if not (partner.country_id and partner.country_id.code == 'AE'):
                 continue
-            # Skip until the user has explicitly opted into PINT AE
-            # configuration on this partner.
+            # Skip until the user has explicitly started filling the partner
+            # form. peppol_eas is intentionally excluded — Odoo's base module
+            # auto-computes it from country=AE, so it fires on the auto
+            # partner Odoo creates inside res.company.create and would block
+            # company creation. We rely on real user-touched fields instead:
+            # any address detail, any tca_* PINT field, or peppol_endpoint.
             opted_in = (
-                partner.peppol_eas == '0235'
+                partner.street
+                or partner.peppol_endpoint
                 or partner.tca_emirate
                 or partner.tca_legal_id_type
                 or partner.tca_trade_license
