@@ -1612,6 +1612,14 @@ class AccountMove(models.Model):
           revision. TODO: implement a custom counter for TCA-active journals.
         """
         # ── Phase 1: pre-post fast checks ─────────────────────────────────────
+        # Phase 1 (pre-XML mandatory-field checks) and Phase 2 (full XML
+        # schematron validation) both honor the tca_skip_post_validation
+        # context flag — used by test fixtures that need to post invoices
+        # to exercise unrelated Python logic (wizard compute, state machine,
+        # status polling) without first satisfying PINT AE invariants.
+        skip_validation = self.env.context.get('tca_skip_post_validation') \
+            or self.env.context.get('tca_skip_schematron')  # legacy alias
+
         pint_moves = self.env['account.move']
         for move in self:
             partner = move.partner_id.commercial_partner_id
@@ -1620,12 +1628,13 @@ class AccountMove(models.Model):
                 and move.is_sale_document()
                 and partner.ubl_cii_format == 'ubl_pint_ae'
             ):
-                errors = move._tca_validate_mandatory_fields()
-                if errors:
-                    raise UserError(_(
-                        'Cannot confirm this invoice — the following issues must be fixed first:\n\n%s',
-                        '\n'.join(f'• {v}' for v in errors)
-                    ))
+                if not skip_validation:
+                    errors = move._tca_validate_mandatory_fields()
+                    if errors:
+                        raise UserError(_(
+                            'Cannot confirm this invoice — the following issues must be fixed first:\n\n%s',
+                            '\n'.join(f'• {v}' for v in errors)
+                        ))
                 pint_moves |= move
 
         # ── Standard Odoo posting (assigns sequence + ledger entries) ────────
@@ -1637,7 +1646,7 @@ class AccountMove(models.Model):
         # logic (state machine, wizard checkbox, status polling) can opt out
         # via context flag — the schematron-specific test suite still runs
         # the pipeline without the flag.
-        if not self.env.context.get('tca_skip_schematron'):
+        if not skip_validation:
             for move in pint_moves:
                 xml_errors = move._tca_validate_xml_pipeline()
                 if xml_errors:

@@ -5,6 +5,7 @@ E7: _compute_enable_tca — TCA option visibility in Send & Print wizard
 E8: _compute_checkbox_send_tca — auto-tick behaviour based on company setting
 """
 
+from odoo import fields
 from odoo.tests import tagged
 
 from .common import TcaTestCase
@@ -157,15 +158,22 @@ class TestComputeCheckboxSendTca(TcaTestCase):
             'ubl_cii_format': 'ubl_pint_ae',
             # No peppol_eas, no peppol_endpoint
         })
-        invoice = self.env['account.move'].with_company(self.company).create({
+        # Bypass post-time PINT AE validation; the partner is intentionally
+        # incomplete because the test asserts the wizard SURFACES that
+        # incompleteness via tca_warning.
+        invoice = self.env['account.move'].with_company(self.company).with_context(
+            tca_skip_post_validation=True,
+        ).create({
             'move_type': 'out_invoice',
             'partner_id': incomplete_partner.id,
             'company_id': self.company.id,
             'journal_id': self.journal.id,
+            'invoice_date': fields.Date.today(),
             'invoice_line_ids': [(0, 0, {
                 'name': 'Test',
                 'quantity': 1.0,
                 'price_unit': 100.0,
+                'product_uom_id': self.env.ref('uom.product_uom_unit').id,
                 'account_id': self.revenue_account.id,
                 'tca_commodity_type': 'S',
             })],

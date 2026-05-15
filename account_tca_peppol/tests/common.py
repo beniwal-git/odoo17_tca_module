@@ -183,12 +183,13 @@ class TcaTestCase(TransactionCase):
             vals['tca_credit_note_reason'] = 'VD'
         if currency:
             vals['currency_id'] = currency.id
-        # tca_skip_schematron bypasses the full PINT AE validation pipeline
-        # in _post for fixture invoices. The dedicated schematron suite in
-        # test_pint_ae_xml.py exercises the validator end-to-end without
+        # tca_skip_post_validation bypasses both Phase 1 (pre-XML mandatory
+        # fields) and Phase 2 (full schematron) in _post for fixture
+        # invoices. The dedicated schematron / mandatory-field suites in
+        # test_pint_ae_xml.py exercise the validators end-to-end without
         # this flag.
         invoice = self.env['account.move'].with_company(self.company).with_context(
-            tca_skip_schematron=True,
+            tca_skip_post_validation=True,
         ).create(vals)
         invoice.action_post()
         return invoice
