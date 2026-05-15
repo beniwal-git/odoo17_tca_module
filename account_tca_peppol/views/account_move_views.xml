@@ -1,63 +1,238 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
 
-    <!-- ── Invoice form: TCA status badge + info ───────────────────────────── -->
+    <!-- ══════════════════════════════════════════════════════════════════════
+         INVOICE FORM: TCA status, buttons, and UAE-specific fields
+         ══════════════════════════════════════════════════════════════════════ -->
     <record id="view_move_form_tca_status" model="ir.ui.view">
         <field name="name">account.move.form.tca.peppol</field>
         <field name="model">account.move</field>
         <field name="inherit_id" ref="account.view_move_form"/>
         <field name="arch" type="xml">
 
-            <!-- TCA status stat button — shown for outbound invoices once submitted -->
+            <!-- Hidden fields for visibility conditions (declared once) -->
             <xpath expr="//div[@name='button_box']" position="inside">
-                <!-- Hidden fields needed for invisible conditions -->
                 <field name="tca_invoice_uuid" invisible="1"/>
                 <field name="tca_submission_error" invisible="1"/>
                 <field name="tca_is_inbound" invisible="1"/>
-                
-                <!-- Retry button: only when error or rejected -->
+                <field name="tca_inbound_status" invisible="1"/>
+                <field name="tca_show_credit_note_fields" invisible="1"/>
+                <field name="tca_is_export" invisible="1"/>
+                <field name="tca_buyer_is_uae" invisible="1"/>
+
+                <!-- Retry button: outbound error/rejected only -->
                 <button name="action_tca_resend"
                         type="object"
                         class="oe_stat_button"
                         icon="fa-refresh"
-                        invisible="tca_move_state not in ('error', 'rejected') or move_type not in ('out_invoice', 'out_refund')">
+                        invisible="tca_move_state not in ('error', 'rejected') or tca_is_inbound or move_type not in ('out_invoice', 'out_refund')">
                     <div class="o_field_widget o_stat_info">
                         <span class="o_stat_text">Retry TCA</span>
                     </div>
                 </button>
-                <!-- Status indicator: non-clickable display badge, shown once a UUID is assigned -->
+
+                <!-- Status badge: shown once submitted -->
                 <button class="oe_stat_button" icon="fa-paper-plane"
-                        invisible="tca_move_state == 'not_sent' or tca_invoice_uuid == False">
+                        invisible="tca_move_state == 'not_sent' or not tca_invoice_uuid">
                     <field name="tca_move_state" widget="badge"
-                           decoration-success="tca_move_state in ('delivered', 'received')"
+                           decoration-success="tca_move_state in ('delivered', 'buyer_confirmed', 'inbound_received')"
                            decoration-warning="tca_move_state in ('submitted', 'processing', 'uploading')"
                            decoration-danger="tca_move_state in ('error', 'rejected', 'cancelled')"
                            string="TCA Status"/>
                 </button>
             </xpath>
 
-        </field>
-    </record>
-
-    <!-- ── Invoice line form: commodity type + HS code fields ─────────────── -->
-    <record id="view_invoice_line_form_tca" model="ir.ui.view">
-        <field name="name">account.move.line.form.tca.peppol</field>
-        <field name="model">account.move.line</field>
-        <field name="inherit_id" ref="account.view_move_line_tree"/>
-        <field name="arch" type="xml">
-            <!-- These columns appear in the optional columns area of the invoice line list -->
-            <xpath expr="//tree" position="inside">
-                <field name="tca_commodity_type" optional="show"
-                       string="Commodity (UAE)"
-                       column_invisible="parent.partner_id.ubl_cii_format != 'ubl_pint_ae'"/>
-                <field name="tca_hs_code" optional="hide"
-                       string="HS Code"
-                       column_invisible="parent.partner_id.ubl_cii_format != 'ubl_pint_ae'"/>
+            <!-- ── Header buttons: Accept/Reject for inbound invoices ──── -->
+            <xpath expr="//header" position="inside">
+                <button name="action_tca_accept_inbound"
+                        string="Accept &amp; Post"
+                        type="object"
+                        class="btn-success"
+                        invisible="not tca_is_inbound or tca_inbound_status != 'pending' or state != 'draft'"
+                        data-hotkey="shift+a"/>
+                <button name="action_tca_reject_inbound"
+                        string="Reject"
+                        type="object"
+                        class="btn-danger"
+                        invisible="not tca_is_inbound or tca_inbound_status != 'pending' or state != 'draft'"
+                        data-hotkey="shift+r"/>
             </xpath>
+
+            <!-- ── UAE compliance: hide native "Credit Note" button on vendor bills.
+                 Per UAE FTA law, only the seller can issue a credit note. The
+                 buyer cannot create a credit note against a received vendor bill. -->
+            <xpath expr="//button[@name='action_reverse']" position="attributes">
+                <attribute name="invisible">move_type not in ('out_invoice', 'in_invoice') or state != 'posted' or (tca_company_is_active and move_type == 'in_invoice')</attribute>
+            </xpath>
+            <xpath expr="//div[@name='button_box']" position="inside">
+                <field name="tca_company_is_active" invisible="1"/>
+            </xpath>
+
+            <!-- ── Inbound status banner ───────────────────────────────── -->
+            <xpath expr="//div[hasclass('oe_title')]" position="after">
+                <div invisible="not tca_is_inbound" class="alert alert-info mb-0" role="alert">
+                    <strong>TCA Peppol Inbound Invoice</strong> —
+                    Status: <field name="tca_inbound_status" readonly="1" widget="badge"
+                                   decoration-success="tca_inbound_status == 'accepted'"
+                                   decoration-danger="tca_inbound_status == 'rejected'"
+                                   decoration-warning="tca_inbound_status == 'pending'"/>
+                    <span invisible="tca_inbound_status != 'rejected'" class="ms-2 text-danger">
+                        Reason: <field name="tca_reject_reason" readonly="1" class="d-inline"/>
+                    </span>
+                </div>
+
+                <!-- Outbound error banner -->
+                <div invisible="not tca_submission_error or tca_is_inbound"
+                     class="alert alert-danger mb-0" role="alert">
+                    <strong>TCA Submission Error:</strong>
+                    <field name="tca_submission_error" readonly="1" class="d-inline"/>
+                </div>
+            </xpath>
+
+            <!-- ── UAE PINT AE fields — inline below customer details ─── -->
+            <xpath expr="//notebook[page[@id='invoice_tab']]" position="before">
+                <group invisible="move_type not in ('out_invoice', 'out_refund', 'in_invoice', 'in_refund')">
+                    <!-- Row 1: core mandatory fields + UAE buyer legal (auto-shown) -->
+                    <group>
+                        <group string="Invoice &amp; Buyer">
+                            <!-- TCA fields are not view-level required: drafts can be saved
+                                 and the user can navigate internal links freely.
+                                 Mandatory-field enforcement runs at Confirm time via
+                                 _tca_validate_mandatory_fields() in account_move._post(). -->
+                            <!-- Invoice type code (380/381/480/81) is auto-set by the
+                                 (move_type, tca_is_out_of_scope) compute. Hidden — the
+                                 user toggles tca_is_out_of_scope below to switch between
+                                 Tax Invoice and Commercial Invoice. The field itself is
+                                 still read by the XML builder. -->
+                            <field name="tca_invoice_type_code" invisible="1"/>
+                            <field name="tca_is_out_of_scope"
+                                   readonly="move_type in ('in_invoice', 'in_refund')"/>
+                            <field name="tca_buyer_reference"
+                                   placeholder="e.g. PO-001/23"
+                                   readonly="move_type in ('in_invoice', 'in_refund')"/>
+                            <field name="tca_buyer_participant_id" string="Buyer Participant ID (TRN)"
+                                   readonly="move_type in ('in_invoice', 'in_refund')"/>
+                            <field name="tca_buyer_emirate"
+                                   invisible="not tca_buyer_is_uae"
+                                   readonly="move_type in ('in_invoice', 'in_refund')"/>
+                            <field name="tca_credit_note_reason"
+                                   invisible="not tca_show_credit_note_fields"/>
+                        </group>
+                        <group string="Buyer Legal" invisible="not tca_buyer_is_uae">
+                            <field name="tca_buyer_legal_id_type"
+                                   readonly="move_type in ('in_invoice', 'in_refund')"/>
+                            <field name="tca_buyer_trade_license"
+                                   readonly="move_type in ('in_invoice', 'in_refund')"/>
+                            <field name="tca_buyer_legal_authority"
+                                   invisible="tca_buyer_legal_id_type != 'TL'"
+                                   readonly="move_type in ('in_invoice', 'in_refund')"/>
+                            <field name="tca_buyer_passport_country_id"
+                                   invisible="tca_buyer_legal_id_type != 'PAS'"
+                                   readonly="move_type in ('in_invoice', 'in_refund')"/>
+                        </group>
+                    </group>
+                    <!-- Row 2: Transaction Type (Optional) — collapsed by default.
+                         Toggle "Use Special Type" reveals 7 user-friendly checkboxes
+                         that compose the BTAE-02 string. Standard invoices: leave the
+                         toggle off (it auto-expands if any flag was set previously). -->
+                    <group>
+                        <group string="Transaction Type (Optional)"
+                               invisible="move_type in ('in_invoice', 'in_refund')">
+                            <field name="tca_show_special_flags" widget="boolean_toggle"/>
+                            <field name="tca_flag_free_trade_zone"
+                                   invisible="not tca_show_special_flags"/>
+                            <!-- ibr-157-ae: Deemed Supply, Margin Scheme and Summary
+                                 Invoice are forbidden on OOS (480 / 81) documents.
+                                 Hide them when the user has ticked "Out of Scope".
+                                 An onchange on tca_is_out_of_scope also auto-clears
+                                 any of these flags that were True so a hidden-but-set
+                                 value cannot leak through to Confirm. -->
+                            <field name="tca_flag_deemed_supply"
+                                   invisible="not tca_show_special_flags or tca_is_out_of_scope"/>
+                            <field name="tca_flag_margin_scheme"
+                                   invisible="not tca_show_special_flags or tca_is_out_of_scope"/>
+                            <field name="tca_flag_summary_invoice"
+                                   invisible="not tca_show_special_flags or tca_is_out_of_scope"/>
+                            <field name="tca_flag_continuous_supply"
+                                   invisible="not tca_show_special_flags"/>
+                            <field name="tca_flag_disclosed_agent"
+                                   invisible="not tca_show_special_flags"/>
+                            <field name="tca_flag_ecommerce"
+                                   invisible="not tca_show_special_flags"/>
+                            <!-- Raw BTAE-02 string kept invisible — computed from the
+                                 booleans above. Read by the XML builder. -->
+                            <field name="tca_transaction_type_flags" invisible="1"/>
+                        </group>
+                        <group string="Additional Details" invisible="move_type in ('in_invoice', 'in_refund') or (not tca_flag_disclosed_agent and not tca_flag_continuous_supply and not tca_flag_summary_invoice and not tca_is_export)">
+                            <field name="tca_principal_id"
+                                   invisible="not tca_flag_disclosed_agent"/>
+                            <field name="tca_contract_reference"
+                                   invisible="not tca_flag_continuous_supply"
+                                   placeholder="e.g. framework-1"/>
+                            <field name="tca_invoice_period_start"
+                                   invisible="not tca_flag_summary_invoice and not tca_flag_continuous_supply"/>
+                            <field name="tca_invoice_period_end"
+                                   invisible="not tca_flag_summary_invoice and not tca_flag_continuous_supply"/>
+                            <field name="tca_billing_frequency"
+                                   invisible="not tca_flag_continuous_supply"/>
+                            <field name="tca_export_declaration_number"
+                                   invisible="not tca_is_export"
+                                   placeholder="e.g. EXP-2026-001"/>
+                        </group>
+                    </group>
+                    <!-- Inbound only: read-only display of optional fields the seller populated.
+                         Each field hides when empty to keep the panel clean. -->
+                    <group string="Additional Information (from seller)"
+                           invisible="move_type not in ('in_invoice', 'in_refund')">
+                        <group>
+                            <field name="tca_buyer_accounting_ref" readonly="1"
+                                   invisible="not tca_buyer_accounting_ref"/>
+                            <field name="tca_project_reference" readonly="1"
+                                   invisible="not tca_project_reference"/>
+                            <field name="tca_contract_reference" readonly="1"
+                                   invisible="not tca_contract_reference"/>
+                            <field name="tca_contract_value" readonly="1"
+                                   invisible="not tca_contract_value"/>
+                            <field name="tca_billing_frequency" readonly="1"
+                                   invisible="not tca_billing_frequency"/>
+                            <field name="tca_incoterms" readonly="1"
+                                   invisible="not tca_incoterms"/>
+                            <field name="tca_principal_id" readonly="1"
+                                   invisible="not tca_principal_id"/>
+                        </group>
+                        <group>
+                            <field name="tca_tax_point_date" readonly="1"
+                                   invisible="not tca_tax_point_date"/>
+                            <field name="tca_delivery_date" readonly="1"
+                                   invisible="not tca_delivery_date"/>
+                            <field name="tca_invoice_period_start" readonly="1"
+                                   invisible="not tca_invoice_period_start"/>
+                            <field name="tca_invoice_period_end" readonly="1"
+                                   invisible="not tca_invoice_period_end"/>
+                            <field name="tca_delivery_party_trn" readonly="1"
+                                   invisible="not tca_delivery_party_trn"/>
+                            <field name="tca_export_declaration_number" readonly="1"
+                                   invisible="not tca_export_declaration_number"/>
+                        </group>
+                    </group>
+                </group>
+            </xpath>
+
+            <!-- ── Invoice line columns: UAE fields ────────────────────── -->
+            <xpath expr="//field[@name='invoice_line_ids']/tree/field[@name='price_unit']" position="after">
+                <field name="tca_commodity_type" optional="show" string="Commodity (UAE)"/>
+                <field name="tca_hs_code" optional="show" string="HS Code"/>
+                <field name="tca_service_accounting_code" optional="hide" string="SAC"/>
+                <field name="tca_standard_item_id" optional="hide" string="GTIN / Standard ID"/>
+                <field name="tca_rc_description" optional="hide" string="RC Description"/>
+            </xpath>
+
         </field>
     </record>
 
-    <!-- ── TCA Peppol Status list/filter ──────────────────────────────────── -->
+    <!-- ══════════════════════════════════════════════════════════════════════
+         LIST VIEW: TCA status column
+         ══════════════════════════════════════════════════════════════════════ -->
     <record id="view_account_move_list_tca" model="ir.ui.view">
         <field name="name">account.move.list.tca.status</field>
         <field name="model">account.move</field>
@@ -66,7 +241,7 @@
             <xpath expr="//tree" position="inside">
                 <field name="tca_move_state" optional="hide" string="TCA Status"
                        widget="badge"
-                       decoration-success="tca_move_state in ('delivered', 'received')"
+                       decoration-success="tca_move_state in ('delivered', 'buyer_confirmed', 'inbound_received')"
                        decoration-warning="tca_move_state in ('submitted', 'processing', 'uploading')"
                        decoration-danger="tca_move_state in ('error', 'rejected', 'cancelled')"
                        decoration-muted="tca_move_state == 'not_sent'"/>
@@ -74,7 +249,9 @@
         </field>
     </record>
 
-    <!-- ── Filters for TCA status in invoice search ───────────────────────── -->
+    <!-- ══════════════════════════════════════════════════════════════════════
+         SEARCH FILTERS: TCA status filters
+         ══════════════════════════════════════════════════════════════════════ -->
     <record id="view_account_move_filter_tca" model="ir.ui.view">
         <field name="name">account.move.filter.tca.peppol</field>
         <field name="model">account.move</field>
@@ -85,46 +262,45 @@
                 <filter string="TCA: Submitted" name="tca_submitted"
                         domain="[('tca_move_state', 'in', ['submitted', 'processing'])]"/>
                 <filter string="TCA: Delivered" name="tca_delivered"
-                        domain="[('tca_move_state', 'in', ['delivered', 'received'])]"/>
+                        domain="[('tca_move_state', 'in', ['delivered', 'buyer_confirmed'])]"/>
                 <filter string="TCA: Error / Rejected" name="tca_error"
                         domain="[('tca_move_state', 'in', ['error', 'rejected'])]"/>
                 <filter string="TCA: Inbound" name="tca_inbound"
                         domain="[('tca_is_inbound', '=', True)]"/>
+                <filter string="TCA: Inbound Pending" name="tca_inbound_pending"
+                        domain="[('tca_is_inbound', '=', True), ('tca_inbound_status', '=', 'pending')]"/>
             </xpath>
         </field>
     </record>
 
-    <!-- ── Send &amp; Print wizard: TCA checkbox ──────────────────────────── -->
-    <!--
-        Inherits the base account send form (same target as account_peppol).
-        Adds the TCA option after the standard "Send by email" checkbox,
-        following the same position pattern as account_peppol uses for
-        checkbox_send_peppol.
-        account_peppol is declared as a conflict in __manifest__.py, so
-        option_peppol will never exist — we insert after option_send_mail directly.
-    -->
+    <!-- ══════════════════════════════════════════════════════════════════════
+         SEND & PRINT WIZARD: TCA checkbox
+         ══════════════════════════════════════════════════════════════════════ -->
     <record id="view_account_move_send_form_tca" model="ir.ui.view">
         <field name="name">account.move.send.form.tca.peppol</field>
         <field name="model">account.move.send</field>
         <field name="inherit_id" ref="account.account_move_send_form"/>
         <field name="arch" type="xml">
 
-            <!-- Warning banner (same area as peppol/ubl_cii warnings) -->
+            <!-- Warning banner -->
             <xpath expr="//div[@name='warnings']" position="inside">
                 <field name="enable_tca" invisible="1"/>
                 <div class="alert alert-warning" role="alert"
                      invisible="not checkbox_send_tca or not tca_warning">
                     <field name="tca_warning"/>
                 </div>
-                <div class="alert alert-info" role="alert"
-                     invisible="not checkbox_send_tca or tca_warning or not show_ubl_company_warning">
-                    Please fill in Peppol EAS and Peppol Endpoint in your
-                    company settings to generate a complete PINT AE file.
-                </div>
             </xpath>
 
-            <!-- TCA option block — positioned after "Send by email" option,
-                 identical pattern to how account_peppol adds its checkbox -->
+            <!-- Hide the generic UBL/CII partner warning when TCA is active
+                 (our tca_warning is more specific and replaces it) -->
+            <xpath expr="//div[@name='warnings']/div[contains(@invisible, 'ubl_partner_warning')]" position="attributes">
+                <attribute name="invisible">checkbox_send_tca or not checkbox_ubl_cii_xml or not ubl_partner_warning</attribute>
+            </xpath>
+            <xpath expr="//div[@name='warnings']/div[contains(@invisible, 'show_ubl_company_warning')]" position="attributes">
+                <attribute name="invisible">checkbox_send_tca or not checkbox_ubl_cii_xml or not show_ubl_company_warning</attribute>
+            </xpath>
+
+            <!-- TCA option after "Send by email" -->
             <xpath expr="//div[@name='option_send_mail']" position="after">
                 <div name="option_tca" invisible="not enable_tca">
                     <field name="checkbox_send_tca" nolabel="1"
@@ -136,6 +312,61 @@
                 </div>
             </xpath>
 
+            <!-- Hide the "PINT AE (UAE Peppol)" XML checkbox when TCA send is ticked -->
+            <xpath expr="//div[@name='option_xml']" position="attributes">
+                <attribute name="invisible">checkbox_send_tca</attribute>
+            </xpath>
+
+        </field>
+    </record>
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         REJECT WIZARD FORM
+         ══════════════════════════════════════════════════════════════════════ -->
+    <record id="tca_inbound_reject_wizard_form" model="ir.ui.view">
+        <field name="name">tca.inbound.reject.wizard.form</field>
+        <field name="model">tca.inbound.reject.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Reject Inbound Invoice">
+                <group>
+                    <field name="move_id" readonly="1"/>
+                    <field name="reason" widget="text"
+                           placeholder="Enter the reason for rejecting this invoice..."/>
+                </group>
+                <footer>
+                    <button name="action_reject" string="Reject Invoice"
+                            type="object" class="btn-primary"/>
+                    <button string="Cancel" class="btn-secondary" special="cancel"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <!-- ══════════════════════════════════════════════════════════════════════
+         REVERSAL WIZARD overrides for TCA-active companies:
+           1. Add the PINT AE BTAE-03 reason picker (required — sets
+              tca_credit_note_reason on the new credit note).
+           2. Hide "Reverse and Create Invoice" — Odoo's standard behavior for
+              that button creates BOTH a credit note AND a replacement
+              invoice draft. The replacement is unwanted noise in the UAE
+              e-invoicing flow; users only want the credit note (which is
+              then atomically posted + submitted to TCA on Confirm).
+              The plain "Reverse" button remains visible.
+         ══════════════════════════════════════════════════════════════════════ -->
+    <record id="view_account_move_reversal_tca" model="ir.ui.view">
+        <field name="name">account.move.reversal.form.tca</field>
+        <field name="model">account.move.reversal</field>
+        <field name="inherit_id" ref="account.view_account_move_reversal"/>
+        <field name="arch" type="xml">
+            <field name="date" position="after">
+                <field name="tca_company_is_active" invisible="1"/>
+                <field name="tca_credit_note_reason"
+                       invisible="not tca_company_is_active or move_type == 'entry'"
+                       required="tca_company_is_active and move_type != 'entry'"/>
+            </field>
+            <xpath expr="//footer/button[@name='modify_moves']" position="attributes">
+                <attribute name="invisible">tca_company_is_active or move_type == 'entry'</attribute>
+            </xpath>
         </field>
     </record>
 

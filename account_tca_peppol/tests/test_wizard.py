@@ -240,10 +240,10 @@ class TestInvoiceCancelBlock(TcaTestCase):
                              'TCA should not block cancellation of not_sent invoice')
 
     def test_reset_to_draft_blocked_in_received(self):
-        """Reset to draft of a received invoice must raise UserError."""
+        """Reset to draft of a buyer_confirmed invoice must raise UserError."""
         from odoo.exceptions import UserError
         invoice = self._make_invoice()
-        invoice.tca_move_state = 'received'
+        invoice.tca_move_state = 'buyer_confirmed'
         with self.assertRaises(UserError):
             invoice.button_draft()
 

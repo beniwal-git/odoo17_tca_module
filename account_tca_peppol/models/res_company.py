@@ -90,28 +90,72 @@ class ResCompany(models.Model):
             raise UserError(_(
                 'Please enter both the TCA Client ID and Client Secret before testing the connection.'
             ))
+        if not self.tca_base_url:
+            raise UserError(_(
+                'Please enter the TCA API Base URL before testing the connection.\n\n'
+                'For sandbox/dev: use the URL provided by TCA.\n'
+                'For production: https://api.tcapeppol.com'
+            ))
         api_service = self.env['tca.api.service']
         try:
             token = api_service._fetch_new_token(self)
             if not token:
-                raise UserError(_('Failed to obtain access token from TCA. Check your credentials.'))
-            # Fetch org info to confirm the token works
+                raise UserError(_(
+                    'Connection failed: TCA did not return an access token.\n\n'
+                    'Please check:\n'
+                    '• Client ID and Client Secret are correct\n'
+                    '• The API Base URL is reachable'
+                ))
             org_info = api_service.get_org_info(self)
             self.tca_org_name = org_info.get('name', '')
             self.tca_is_active = True
+            # Seed OOS taxes for sale + purchase so users can immediately
+            # tick "Out of Scope" on an invoice without first configuring
+            # the chart of accounts. Idempotent — safe to re-run.
+            for direction in ('sale', 'purchase'):
+                self.env['account.tax']._tca_ensure_oos_tax(self, direction)
+        except UserError:
+            self.tca_is_active = False
+            self.tca_org_name = ''
+            raise
         except Exception as exc:
             self.tca_is_active = False
             self.tca_org_name = ''
-            raise UserError(_('TCA connection test failed: %s', str(exc))) from exc
+            error_str = str(exc)
+            # Make common errors more user-friendly
+            if 'nodename nor servname' in error_str or 'Name or service not known' in error_str:
+                raise UserError(_(
+                    'Connection failed: Cannot reach the TCA server.\n\n'
+                    'The API Base URL "%s" could not be resolved.\n'
+                    'Please check the URL is correct.',
+                    self.tca_base_url
+                )) from exc
+            if '401' in error_str or 'authentication' in error_str.lower():
+                raise UserError(_(
+                    'Connection failed: Authentication rejected (401).\n\n'
+                    'Please check your Client ID and Client Secret are correct.'
+                )) from exc
+            if 'timed out' in error_str.lower() or 'timeout' in error_str.lower():
+                raise UserError(_(
+                    'Connection failed: Request timed out.\n\n'
+                    'The TCA server at "%s" did not respond in time.\n'
+                    'Please try again or check if the URL is correct.',
+                    self.tca_base_url
+                )) from exc
+            raise UserError(_(
+                'Connection failed: %s\n\n'
+                'Please check your TCA credentials and API Base URL.',
+                error_str
+            )) from exc
 
         return {
             'type': 'ir.actions.client',
             'tag': 'display_notification',
             'params': {
-                'title': _('TCA Connection Successful'),
+                'title': _('✓ TCA Connection Successful'),
                 'message': _('Connected to TCA organisation: %s', self.tca_org_name or 'Unknown'),
                 'type': 'success',
-                'sticky': False,
+                'sticky': True,
             },
         }
 

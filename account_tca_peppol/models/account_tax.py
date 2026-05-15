@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Part of TCA. See LICENSE file for full copyright and licensing details.
 
-from odoo import fields, models
+from odoo import _, api, fields, models
 
 # UAE VAT category codes per PINT AE / UNCL5305
 UAE_TAX_CATEGORY_SELECTION = [
@@ -61,3 +61,49 @@ class AccountTax(models.Model):
             '"Exempt under Article 42 of UAE VAT Decree-Law".'
         ),
     )
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @api.model
+    def _tca_ensure_oos_tax(self, company, type_tax_use='sale'):
+        """
+        Return (creating if missing) the company's 0% Out-of-Scope tax for the
+        given direction. Idempotent — called both eagerly at TCA connection
+        time and lazily from the Out-of-Scope onchange so a user who hasn't
+        yet wired the chart of accounts can still tick OOS and proceed.
+
+        PINT AE rule ibr-sr-58 requires every line to carry a tax category;
+        the value for OOS documents is 'O' with scheme 'VAT' (per the official
+        Commercial invoice example). A 0% tax with tca_tax_category='O' is
+        the minimum Odoo object that satisfies that contract.
+        """
+        existing = self.sudo().search([
+            ('company_id', '=', company.id),
+            ('tca_tax_category', '=', 'O'),
+            ('amount', '=', 0.0),
+            ('type_tax_use', '=', type_tax_use),
+        ], limit=1)
+        if existing:
+            return existing
+
+        # tax_group_id is required on account.tax. Reuse the company's
+        # existing 0%/zero tax group if any, else fall back to the first
+        # tax group visible to this company.
+        tax_group = self.env['account.tax.group'].sudo().search(
+            [('company_id', '=', company.id)], limit=1,
+        )
+        if not tax_group:
+            tax_group = self.env['account.tax.group'].sudo().search([], limit=1)
+
+        label = _('0%% Out-of-Scope (UAE)') if type_tax_use == 'sale' \
+            else _('0%% Out-of-Scope (UAE) — Purchases')
+        return self.sudo().create({
+            'name': label,
+            'description': _('Out-of-Scope supply — no UAE VAT (PINT AE category O).'),
+            'amount': 0.0,
+            'amount_type': 'percent',
+            'type_tax_use': type_tax_use,
+            'company_id': company.id,
+            'tax_group_id': tax_group.id if tax_group else False,
+            'tca_tax_category': 'O',
+        })

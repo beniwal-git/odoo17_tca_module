@@ -7,58 +7,50 @@
         <field name="inherit_id" ref="account.res_config_settings_view_form"/>
         <field name="arch" type="xml">
 
-            <!-- TCA Peppol credentials block — inserted after Customer Invoices -->
             <xpath expr="//block[@id='invoicing_settings']" position="after">
                 <block title="TCA Peppol E-Invoicing (UAE)" id="tca_peppol_settings">
 
-                    <!-- Master toggle -->
-                    <setting string="TCA Peppol Integration"
-                             help="Send and receive UAE PINT AE e-invoices via the TCA Access Point. Replaces Odoo's native Peppol integration for UAE companies.">
-                        <field name="tca_is_active" widget="boolean_toggle"/>
-                    </setting>
-
-                    <!-- Auto-send default (only visible when TCA is active) -->
-                    <setting string="Default Sending Options"
-                             invisible="tca_is_active == False">
-                        <div>
-                            <field name="invoice_is_tca"/>
-                            <label for="invoice_is_tca"/>
-                            <span class="fa fa-lg fa-building-o" title="Values set here are company-specific."/>
+                    <!-- ── Step 0: Registration info ──────────────────────── -->
+                    <setting string="Get Started with TCA"
+                             help="Register with TCA to get your API credentials. TCA will guide you through EMARA registration to authorize TCA as your Accredited Service Provider (ASP).">
+                        <div class="content-group">
+                            <div class="alert alert-info mt8 mb0">
+                                <strong>Setup Steps:</strong>
+                                <ol class="mb-0 mt-1">
+                                    <li>Register at the <a href="https://portal-dev.taxcomplianceagent.com/login?redirectTo=%2F" target="_blank" class="alert-link">TCA Portal ↗</a> — TCA will redirect you to EMARA to register TCA as your ASP</li>
+                                    <li>In the TCA portal, go to <b>Settings → API Clients → Create Client</b> to get your Client ID and Secret</li>
+                                    <li>Enter the credentials below and click <b>Test Connection</b></li>
+                                </ol>
+                            </div>
                         </div>
                     </setting>
 
-                    <!-- Credentials (only visible when active) -->
-                    <setting string="TCA Credentials"
-                             invisible="tca_is_active == False">
+                    <!-- ── Step 1: Master toggle ──────────────────────────── -->
+                    <setting string="Enable TCA Peppol Integration"
+                             help="When enabled, invoices to UAE PINT AE partners can be sent via TCA Peppol.">
+                        <div class="content-group">
+                            <field name="tca_is_active" widget="boolean_toggle" nolabel="1"/>
+                        </div>
+                    </setting>
+
+                    <!-- ── Step 2: Credentials (visible when active) ──────── -->
+                    <setting string="TCA API Credentials"
+                             invisible="not tca_is_active">
                         <div class="content-group">
                             <div class="row mt16">
-                                <label for="tca_client_id" string="TCA Client ID" class="col-lg-3 o_light_label"/>
+                                <label for="tca_client_id" string="Client ID" class="col-lg-3 o_light_label"/>
                                 <field name="tca_client_id" class="col-lg-7"
-                                       placeholder="Enter TCA Client ID"/>
+                                       placeholder="From TCA Portal → Settings → API Clients"/>
                             </div>
                             <div class="row mt8">
-                                <label for="tca_client_secret" string="TCA Client Secret" class="col-lg-3 o_light_label"/>
+                                <label for="tca_client_secret" string="Client Secret" class="col-lg-3 o_light_label"/>
                                 <field name="tca_client_secret" class="col-lg-7"
                                        password="True"
-                                       placeholder="Enter TCA Client Secret"/>
+                                       placeholder="Visible only once at creation in TCA portal"/>
                             </div>
                             <div class="row mt8">
-                                <label for="tca_base_url" string="TCA API Base URL" class="col-lg-3 o_light_label"/>
-                                <field name="tca_base_url" class="col-lg-7"
-                                       placeholder="https://api.tcapeppol.com"/>
-                            </div>
-                            <div class="row mt8">
-                                <label for="tca_webhook_secret" string="TCA Webhook Secret" class="col-lg-3 o_light_label"/>
-                                <field name="tca_webhook_secret" class="col-lg-7"
-                                       password="True"
-                                       placeholder="Webhook HMAC secret from TCA portal"/>
-                            </div>
-                            <div class="row mt8"
-                                 invisible="tca_org_name == False">
-                                <span class="col-lg-3 o_form_label">Connected Organisation</span>
-                                <span class="col-lg-7 text-success fw-bold">
-                                    <field name="tca_org_name" readonly="1"/>
-                                </span>
+                                <label for="tca_base_url" string="API Base URL" class="col-lg-3 o_light_label"/>
+                                <field name="tca_base_url" class="col-lg-7"/>
                             </div>
                             <div class="row mt16">
                                 <div class="col-lg-10 offset-lg-3">
@@ -66,20 +58,30 @@
                                             string="Test Connection"
                                             type="object"
                                             class="btn btn-primary me-2"
-                                            invisible="tca_client_id == False"/>
+                                            invisible="not tca_client_id"/>
                                     <button name="action_tca_disconnect"
                                             string="Disconnect"
                                             type="object"
-                                            class="btn btn-secondary"
-                                            invisible="tca_org_name == False"/>
+                                            class="btn btn-outline-danger"
+                                            invisible="not tca_org_name"/>
                                 </div>
                             </div>
-                            <div class="row mt8">
-                                <div class="col-lg-10 offset-lg-3 text-muted">
-                                    <i class="fa fa-info-circle"/> Webhook URL to register in the TCA portal:
-                                    <code>/tca/webhook/invoice-status</code>
-                                </div>
+                            <div class="row mt8" invisible="not tca_org_name">
+                                <span class="col-lg-3 o_form_label">Connected to</span>
+                                <span class="col-lg-7 text-success fw-bold">
+                                    <i class="fa fa-check-circle"/> <field name="tca_org_name" readonly="1"/>
+                                </span>
                             </div>
+                        </div>
+                    </setting>
+
+                    <!-- ── Step 3: Default sending options ─────────────────── -->
+                    <setting string="Default Sending Options"
+                             invisible="not tca_is_active"
+                             help="When enabled, the 'Submit via TCA Peppol' checkbox is pre-selected by default in the Send &amp; Print dialog for UAE partners.">
+                        <div>
+                            <field name="invoice_is_tca"/>
+                            <label for="invoice_is_tca"/>
                         </div>
                     </setting>
 

@@ -3,7 +3,7 @@
 
 {
     'name': 'TCA Peppol E-Invoicing (UAE PINT AE)',
-    'version': '17.0.1.0.0',
+    'version': '17.0.2.1.0',
     'category': 'Accounting/Accounting',
     'summary': 'UAE PINT AE e-invoicing via TCA Access Point',
     'description': """
@@ -40,12 +40,12 @@
         'views/account_move_views.xml',
         'views/res_partner_views.xml',
         'views/account_tax_views.xml',
-        'wizard/tca_inbound_reject_views.xml',
     ],
     'license': 'OPL-1',
     'auto_install': False,
     'installable': True,
     'application': False,
+    'post_init_hook': '_post_init_migrate_invoice_type_code',
     'images': [],
     # Test files — discovered by Odoo's test runner via tests/__init__.py
     # Run with:  ./odoo-bin -i account_tca_peppol --test-enable --stop-after-init
