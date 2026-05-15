@@ -36,6 +36,47 @@ class ResCompany(models.Model):
         ),
     )
 
+    # ── PINT AE fields surfaced from partner_id ───────────────────────────────
+    # These live on res.partner. Mirroring them here as related fields so the
+    # company form (Settings → Companies) can host a "PINT AE / E-Invoicing"
+    # tab — Enterprise's res.company form doesn't render the partner's own
+    # E-Invoicing tab, only a subset of address/contact fields. Editing here
+    # writes through to partner_id, so the partner form and company form stay
+    # in sync.
+
+    peppol_eas = fields.Selection(
+        related='partner_id.peppol_eas', readonly=False,
+        string='Peppol EAS',
+    )
+    peppol_endpoint = fields.Char(
+        related='partner_id.peppol_endpoint', readonly=False,
+        string='Peppol Endpoint',
+    )
+    tca_emirate = fields.Selection(
+        related='partner_id.tca_emirate', readonly=False,
+        string='Emirate',
+    )
+    tca_legal_id_type = fields.Selection(
+        related='partner_id.tca_legal_id_type', readonly=False,
+        string='Legal ID Type',
+    )
+    tca_legal_authority = fields.Char(
+        related='partner_id.tca_legal_authority', readonly=False,
+        string='Issuing Authority',
+    )
+    tca_trade_license = fields.Char(
+        related='partner_id.tca_trade_license', readonly=False,
+        string='Trade License / Registration ID',
+    )
+    tca_passport_country_id = fields.Many2one(
+        'res.country', related='partner_id.tca_passport_country_id',
+        readonly=False, string='Passport Issuing Country',
+    )
+    tca_legal_form = fields.Char(
+        related='partner_id.tca_legal_form', readonly=False,
+        string='Legal Form',
+    )
+
     # ── Read-only info fetched from TCA ───────────────────────────────────────
 
     tca_org_name = fields.Char(

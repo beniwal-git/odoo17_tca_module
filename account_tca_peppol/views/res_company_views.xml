@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!--
+        Add a "PINT AE / E-Invoicing" tab to the res.company form. The same
+        fields live on res.partner (and show up there under the "E-Invoicing"
+        tab via res_partner_views.xml), but Enterprise's res.company form
+        renders only a subset of partner fields — there's no built-in path
+        to the partner's E-Invoicing tab from Settings → Companies.
+
+        These are related fields (defined on res.company in res_company.py),
+        so writes flow through to partner_id and stay consistent with the
+        partner form.
+    -->
+    <record id="view_company_form_tca_peppol" model="ir.ui.view">
+        <field name="name">res.company.form.tca.peppol</field>
+        <field name="model">res.company</field>
+        <field name="inherit_id" ref="base.view_company_form"/>
+        <field name="arch" type="xml">
+
+            <xpath expr="//notebook" position="inside">
+                <page name="tca_peppol" string="PINT AE / E-Invoicing">
+                    <group>
+                        <group string="Peppol Routing">
+                            <field name="peppol_eas" string="Peppol EAS"/>
+                            <field name="peppol_endpoint"
+                                   string="Peppol Endpoint"
+                                   placeholder="10-digit UAE Participant ID, e.g. 1XXXXXXXXX"/>
+                        </group>
+                        <group string="UAE Address">
+                            <field name="tca_emirate" string="Emirate"/>
+                        </group>
+                    </group>
+                    <group>
+                        <group string="UAE Legal Registration">
+                            <field name="tca_legal_id_type" string="Legal ID Type"/>
+                            <field name="tca_trade_license"
+                                   string="Trade License / Registration ID"/>
+                            <field name="tca_legal_authority"
+                                   string="Issuing Authority"
+                                   invisible="tca_legal_id_type != 'TL'"/>
+                            <field name="tca_passport_country_id"
+                                   string="Passport Issuing Country"
+                                   invisible="tca_legal_id_type != 'PAS'"/>
+                            <field name="tca_legal_form" string="Legal Form"/>
+                        </group>
+                    </group>
+                </page>
+            </xpath>
+
+        </field>
+    </record>
+
+</odoo>
