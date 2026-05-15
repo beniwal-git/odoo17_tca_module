@@ -415,14 +415,13 @@ class TestPintAeBtae02ExportFlag(TcaTestCase):
         self.assertEqual(pei, '01000000',
                          f'User flags must pass through unchanged for AE buyer, got "{pei}"')
 
-    def test_invalid_flags_reset_then_export_bit_applied(self):
-        """Invalid flags (wrong length) reset to 00000000; export bit still applied for non-AE buyer."""
-        invoice = self._make_invoice(partner=self.uk_partner)
-        invoice.tca_transaction_type_flags = 'BADVALUE'
-        pei = self._get_pei(invoice)
-        # After reset: 00000000 → export bit set → 00000001
-        self.assertEqual(pei, '00000001',
-                         f'After invalid flags reset, non-AE export bit must be set, got "{pei}"')
+    # Note: an earlier version of this suite tested writing a bad string
+    # ("BADVALUE") to tca_transaction_type_flags and expected a graceful
+    # reset to "00000000" at export time. The field is now a computed
+    # 8-char string derived from 7 boolean fields, so it can no longer
+    # carry an invalid value — the constraint rejects writes upstream of
+    # the export path. The test has been removed; the format guarantee
+    # is covered by _check_tca_transaction_type_flags_format on the model.
 
     def test_profile_execution_id_still_8_chars_for_export(self):
         """ProfileExecutionID for export invoice must still be exactly 8 chars."""

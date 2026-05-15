@@ -149,20 +149,29 @@ class TcaTestCase(TransactionCase):
         Pass partner= to override the default UAE buyer (e.g. for export tests).
         Returns a posted account.move.
         """
+        # PINT AE export validation needs a UoM on every line and, when the
+        # commodity type is Services or Both, a BTAE-17 Service Accounting
+        # Code (ibr-185-ae). Default UoM is "Units" — always present in
+        # base data.
+        uom_unit = self.env.ref('uom.product_uom_unit')
+        line_vals = {
+            'name': 'Consulting Services',
+            'quantity': quantity,
+            'price_unit': price_unit,
+            'product_uom_id': uom_unit.id,
+            'tax_ids': [(6, 0, [self.tax_5.id])],
+            'account_id': self.revenue_account.id,
+            'tca_commodity_type': commodity_type,
+        }
+        if commodity_type in ('S', 'B'):
+            line_vals['tca_service_accounting_code'] = '998313'  # Mgmt consulting (SAC)
         vals = {
             'move_type': move_type,
             'partner_id': (partner or self.partner).id,
             'company_id': self.company.id,
             'journal_id': self.journal.id,
             'tca_buyer_reference': 'PO-TEST-001',
-            'invoice_line_ids': [(0, 0, {
-                'name': 'Consulting Services',
-                'quantity': quantity,
-                'price_unit': price_unit,
-                'tax_ids': [(6, 0, [self.tax_5.id])],
-                'account_id': self.revenue_account.id,
-                'tca_commodity_type': commodity_type,
-            })],
+            'invoice_line_ids': [(0, 0, line_vals)],
         }
         # Credit notes need reason (BTAE-03) — use VD (Volume Discount, no preceding ref needed)
         if move_type in ('out_refund', 'in_refund'):
