@@ -1633,15 +1633,19 @@ class AccountMove(models.Model):
 
         # ── Phase 2: full XML validation on the just-posted invoice ──────────
         # Raising here rolls back super()._post() — invoice returns to draft,
-        # no ledger entries persist.
-        for move in pint_moves:
-            xml_errors = move._tca_validate_xml_pipeline()
-            if xml_errors:
-                raise UserError(_(
-                    'Cannot confirm this invoice — PINT AE validation failed:\n\n%s\n\n'
-                    'Fix these issues, then try Confirm again.',
-                    '\n'.join(f'• {v}' for v in xml_errors)
-                ))
+        # no ledger entries persist. Tests that exercise unrelated Python
+        # logic (state machine, wizard checkbox, status polling) can opt out
+        # via context flag — the schematron-specific test suite still runs
+        # the pipeline without the flag.
+        if not self.env.context.get('tca_skip_schematron'):
+            for move in pint_moves:
+                xml_errors = move._tca_validate_xml_pipeline()
+                if xml_errors:
+                    raise UserError(_(
+                        'Cannot confirm this invoice — PINT AE validation failed:\n\n%s\n\n'
+                        'Fix these issues, then try Confirm again.',
+                        '\n'.join(f'• {v}' for v in xml_errors)
+                    ))
 
         # ── Phase 3: TCA submission for credit notes (atomic with post) ───────
         # UAE FTA requires that a credit note must reach the Peppol network
