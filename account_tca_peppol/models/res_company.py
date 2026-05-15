@@ -77,6 +77,41 @@ class ResCompany(models.Model):
         string='Legal Form',
     )
 
+    # Names of related fields that proxy partner_id. Used by write() to
+    # batch the cascade into a single partner write — see comment there.
+    _TCA_PARTNER_RELATED_FIELDS = (
+        'peppol_eas', 'peppol_endpoint',
+        'tca_emirate', 'tca_legal_id_type', 'tca_legal_authority',
+        'tca_trade_license', 'tca_passport_country_id', 'tca_legal_form',
+    )
+
+    def write(self, vals):
+        """
+        Batch partner-related field writes into a single partner_id.write so
+        the _check_tca_partner_complete constraint sees the complete new
+        state instead of the mid-cascade state.
+
+        Why this is needed: Odoo's framework writes related fields by calling
+        each field's inverse in turn. For our related fields (which all map
+        to the same partner_id), that produces several separate
+        partner.write({single_field: value}) calls. The constraint fires on
+        each, and the first one trips the opt-in heuristic (e.g. tca_emirate
+        becomes set) but the remaining fields haven't been propagated yet,
+        so the constraint raises ValidationError on fields the user has
+        actually filled — just on the next inverse call.
+
+        We intercept here, peel the partner-related keys out of vals, write
+        them once to partner_id ourselves, and let the rest of write()
+        proceed normally.
+        """
+        partner_vals = {k: vals.pop(k) for k in list(vals)
+                        if k in self._TCA_PARTNER_RELATED_FIELDS}
+        if partner_vals:
+            for company in self:
+                if company.partner_id:
+                    company.partner_id.write(partner_vals)
+        return super().write(vals)
+
     # ── Read-only info fetched from TCA ───────────────────────────────────────
 
     tca_org_name = fields.Char(
