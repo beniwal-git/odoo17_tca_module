@@ -47,7 +47,9 @@ class TcaTestCase(TransactionCase):
             'street': 'Sheikh Zayed Road',
             'city': 'Dubai',
             'peppol_eas': '0235',
-            'peppol_endpoint': '100230400900003',
+            # peppol_endpoint must be the 10-digit UAE Participant ID
+            # (^1[0-9]{9}$). The 15-char TRN lives in `vat`.
+            'peppol_endpoint': '1002304009',
             'tca_emirate': 'DXB',
             'tca_legal_id_type': 'TL',
             'tca_trade_license': 'DED-2024-000001',
@@ -68,9 +70,11 @@ class TcaTestCase(TransactionCase):
             'country_id': cls.uae.id,
             'street': 'Corniche Road',
             'city': 'Abu Dhabi',
-            'vat': '200000000000003',
+            # UAE TRN: 15 chars starting with "1" (^1[a-zA-Z0-9]{14}$).
+            'vat': '100000000000003',
             'peppol_eas': '0235',
-            'peppol_endpoint': '200000000000003',
+            # 10-digit Participant ID: ^1[0-9]{9}$
+            'peppol_endpoint': '1999999999',
             'ubl_cii_format': 'ubl_pint_ae',
             'tca_emirate': 'AUH',
             'tca_legal_id_type': 'TL',
